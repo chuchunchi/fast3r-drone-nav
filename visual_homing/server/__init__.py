@@ -8,6 +8,7 @@ from .keyframe_manager import Keyframe, KeyframeStackManager
 from .state_machine import SystemState, StateMachine
 from .pid_controller import PIDController
 from .homing_controller import HomingController
+from .websocket_server import WebSocketServer
 
 __all__ = [
     "Config",
@@ -21,6 +22,7 @@ __all__ = [
     "StateMachine",
     "PIDController",
     "HomingController",
+    "WebSocketServer",
 ]
 
 
