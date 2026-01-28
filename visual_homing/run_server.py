@@ -46,16 +46,60 @@ class MockFrameProcessor:
     without requiring GPU/model loading.
     """
 
-    def __init__(self):
+    def __init__(self, save_sample_image: bool = True):
         self.state_machine = StateMachine()
         self.frame_count = 0
         self.keyframe_count = 0
         self.total_distance = 0.0
         self.last_telemetry_time = None
+        self.save_sample_image = save_sample_image
+        self.image_validated = False
+
+    def _validate_image(self, frame: FrameMessage) -> bool:
+        """Validate and optionally save received image."""
+        try:
+            import cv2
+            import numpy as np
+            
+            # Decode JPEG
+            img_array = np.frombuffer(frame.image_data, dtype=np.uint8)
+            image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            
+            if image is None:
+                logger.error(f"❌ Frame {frame.frame_id}: Failed to decode JPEG image!")
+                return False
+            
+            height, width, channels = image.shape
+            jpeg_size_kb = len(frame.image_data) / 1024
+            
+            logger.info(
+                f"✅ Frame {frame.frame_id}: Image decoded successfully! "
+                f"Size: {width}x{height}, Channels: {channels}, JPEG: {jpeg_size_kb:.1f}KB"
+            )
+            
+            # Save first image to disk for visual inspection
+            if self.save_sample_image and not self.image_validated:
+                sample_path = Path(__file__).parent / "sample_frame.jpg"
+                cv2.imwrite(str(sample_path), image)
+                logger.info(f"📸 Sample image saved to: {sample_path}")
+            
+            return True
+            
+        except ImportError:
+            logger.warning("OpenCV not available - skipping image validation")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Image validation error: {e}")
+            return False
 
     def process_frame(self, frame: FrameMessage) -> dict:
         """Process frame and return mock response."""
         self.frame_count += 1
+
+        # Validate first 3 images to ensure protocol is working
+        if self.frame_count <= 3 or (not self.image_validated and self.frame_count % 100 == 0):
+            if self._validate_image(frame):
+                self.image_validated = True
 
         # Simulate distance tracking from telemetry
         if self.last_telemetry_time is not None:
