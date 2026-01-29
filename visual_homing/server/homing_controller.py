@@ -1,8 +1,9 @@
 """Main homing controller integrating all components."""
 
 import logging
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -28,6 +29,29 @@ class HomingResult:
     keyframes_remaining: int  # Number of keyframes left
     confidence: float  # Pose estimation confidence
     pose_result: Optional[PoseResult] = None  # Full pose result
+    low_confidence: bool = False  # True if confidence below threshold
+    inference_time_ms: float = 0.0  # Time for Fast3R inference
+
+
+@dataclass
+class HomingStats:
+    """Statistics for homing phase."""
+    
+    total_frames: int = 0
+    successful_poses: int = 0
+    low_confidence_frames: int = 0
+    failed_poses: int = 0
+    waypoints_reached: int = 0
+    total_inference_time_ms: float = 0.0
+    command_history: List[Dict[str, float]] = field(default_factory=list)
+    
+    @property
+    def avg_inference_time_ms(self) -> float:
+        return self.total_inference_time_ms / max(1, self.total_frames)
+    
+    @property
+    def success_rate(self) -> float:
+        return self.successful_poses / max(1, self.total_frames)
 
 
 class HomingController:
@@ -104,6 +128,15 @@ class HomingController:
         # Homing state
         self.target_idx: int = -1
         self.metric_scale: float = 1.0
+        
+        # Statistics and debugging
+        self.stats = HomingStats()
+        self._consecutive_failures: int = 0
+        self._max_consecutive_failures: int = 10  # Skip keyframe after 10 failures
+        
+        # Last pose result for debugging
+        self._last_pose_result: Optional[PoseResult] = None
+        self._last_translation: Optional[np.ndarray] = None
 
     def initialize(self) -> None:
         """Initialize the controller (load model, etc.)."""
@@ -207,8 +240,15 @@ class HomingController:
         # Start from last keyframe
         self.target_idx = len(self.keyframe_manager) - 1
         self.pid.reset()
+        
+        # Reset homing-specific state
+        self.stats = HomingStats()
+        self._consecutive_failures = 0
+        self._last_pose_result = None
+        self._last_translation = None
 
         logger.info(f"Starting homing with {self.target_idx + 1} keyframes")
+        logger.info(f"Metric scale: {self.metric_scale:.4f}")
         return True
 
     def process_homing_frame(
@@ -226,16 +266,18 @@ class HomingController:
         Returns:
             HomingResult with command and status.
         """
+        self.stats.total_frames += 1
+        
         # Check if homing is complete
         if self.target_idx < 0:
-            if self.state_machine.complete_homing():
-                return HomingResult(
-                    state="COMPLETED",
-                    command=create_hover_command(),
-                    target_distance_m=0.0,
-                    keyframes_remaining=0,
-                    confidence=1.0,
-                )
+            self.state_machine.complete_homing()
+            return HomingResult(
+                state="COMPLETED",
+                command=create_hover_command(),
+                target_distance_m=0.0,
+                keyframes_remaining=0,
+                confidence=1.0,
+            )
 
         if not self.state_machine.is_homing():
             return HomingResult(
@@ -249,8 +291,11 @@ class HomingController:
         # Get target keyframe
         target_keyframe = self.keyframe_manager[self.target_idx]
 
-        # Run Fast3R inference
+        # Run Fast3R inference with timing
+        t_start = time.time()
         result = self.fast3r.infer_pair(live_frame, target_keyframe.image)
+        inference_time_ms = (time.time() - t_start) * 1000
+        self.stats.total_inference_time_ms += inference_time_ms
 
         # Compute relative pose
         pose_result = self.pose_estimator.estimate_pose(
@@ -258,9 +303,24 @@ class HomingController:
             result["pts3d_2"],  # Target frame points
             result["conf_1"],  # Use live frame confidence
         )
+        
+        self._last_pose_result = pose_result
 
+        # Handle pose estimation failure
         if not pose_result.success:
-            logger.warning("Pose estimation failed, hovering")
+            self.stats.failed_poses += 1
+            self._consecutive_failures += 1
+            logger.warning(
+                f"Pose estimation failed (attempt {self._consecutive_failures}), hovering"
+            )
+            
+            # Skip to next keyframe if too many consecutive failures
+            if self._consecutive_failures >= self._max_consecutive_failures:
+                logger.warning(
+                    f"Too many failures on keyframe {self.target_idx}, skipping"
+                )
+                self._advance_to_next_keyframe()
+            
             return HomingResult(
                 state="HOMING",
                 command=create_hover_command(),
@@ -268,11 +328,13 @@ class HomingController:
                 keyframes_remaining=self.target_idx + 1,
                 confidence=pose_result.confidence,
                 pose_result=pose_result,
+                inference_time_ms=inference_time_ms,
             )
 
         # Extract pose error in camera frame
         t_cam = pose_result.translation.cpu().numpy()
         R = pose_result.rotation
+        self._last_translation = t_cam.copy()
 
         # Camera frame: X=right, Y=down, Z=forward
         error_forward = float(t_cam[2])
@@ -282,10 +344,27 @@ class HomingController:
 
         # Compute distance to target
         distance_to_target = np.linalg.norm(t_cam)
+        
+        # Check for low confidence
+        low_confidence = pose_result.confidence < self.config.min_confidence
+        if low_confidence:
+            self.stats.low_confidence_frames += 1
+            logger.debug(
+                f"Low confidence ({pose_result.confidence:.3f}), "
+                f"reducing velocity"
+            )
+            # Reduce velocities when confidence is low
+            velocity_scale = pose_result.confidence / self.config.min_confidence
+            velocity_scale = max(0.3, min(1.0, velocity_scale))  # Clamp to [0.3, 1.0]
+        else:
+            self.stats.successful_poses += 1
+            self._consecutive_failures = 0  # Reset failure counter on success
+            velocity_scale = 1.0
 
         # Check if we've reached the waypoint
         if distance_to_target < self.config.waypoint_threshold_m:
             self._advance_to_next_keyframe()
+            self.stats.waypoints_reached += 1
 
         # PID control
         command = self.pid.compute(
@@ -294,6 +373,24 @@ class HomingController:
             error_vertical,
             error_yaw,
         )
+        
+        # Apply velocity scaling for low confidence
+        if velocity_scale < 1.0:
+            command = {
+                k: v * velocity_scale for k, v in command.items()
+            }
+        
+        # Store command in history (for debugging/visualization)
+        self.stats.command_history.append(command.copy())
+        
+        # Log periodically
+        if self.stats.total_frames % 10 == 0:
+            logger.debug(
+                f"Frame {self.stats.total_frames}: "
+                f"target={self.target_idx}, dist={distance_to_target:.2f}m, "
+                f"conf={pose_result.confidence:.2f}, "
+                f"cmd=[{command['pitch_velocity']:.2f}, {command['roll_velocity']:.2f}]"
+            )
 
         return HomingResult(
             state="HOMING",
@@ -302,6 +399,8 @@ class HomingController:
             keyframes_remaining=self.target_idx + 1,
             confidence=pose_result.confidence,
             pose_result=pose_result,
+            low_confidence=low_confidence,
+            inference_time_ms=inference_time_ms,
         )
 
     def _advance_to_next_keyframe(self) -> None:
@@ -346,11 +445,52 @@ class HomingController:
         self.pid.reset()
         self.target_idx = -1
         self.metric_scale = 1.0
+        self.stats = HomingStats()
+        self._consecutive_failures = 0
+        self._last_pose_result = None
+        self._last_translation = None
         logger.info("Homing controller reset")
 
     def emergency_stop(self) -> Dict[str, float]:
         """Immediate stop - return hover command."""
         self.pid.reset()
         return create_hover_command()
+    
+    def get_stats(self) -> HomingStats:
+        """Get homing statistics."""
+        return self.stats
+    
+    def get_last_pose_result(self) -> Optional[PoseResult]:
+        """Get the last pose estimation result for debugging."""
+        return self._last_pose_result
+    
+    def get_last_translation(self) -> Optional[np.ndarray]:
+        """Get the last translation vector for debugging."""
+        return self._last_translation
+    
+    def get_debug_info(self) -> Dict:
+        """Get debug information about current state."""
+        info = {
+            "state": self.state_machine.state.name,
+            "target_idx": self.target_idx,
+            "keyframe_count": len(self.keyframe_manager),
+            "total_distance_m": self.keyframe_manager.get_total_distance(),
+            "metric_scale": self.metric_scale,
+            "consecutive_failures": self._consecutive_failures,
+            "stats": {
+                "total_frames": self.stats.total_frames,
+                "successful_poses": self.stats.successful_poses,
+                "failed_poses": self.stats.failed_poses,
+                "low_confidence_frames": self.stats.low_confidence_frames,
+                "waypoints_reached": self.stats.waypoints_reached,
+                "avg_inference_time_ms": self.stats.avg_inference_time_ms,
+                "success_rate": self.stats.success_rate,
+            },
+        }
+        if self._last_translation is not None:
+            info["last_translation"] = self._last_translation.tolist()
+        if self._last_pose_result is not None:
+            info["last_confidence"] = self._last_pose_result.confidence
+        return info
 
 
