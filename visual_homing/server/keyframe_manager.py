@@ -54,6 +54,11 @@ class KeyframeStackManager:
     - Supports stack pop when waypoint is reached
     """
 
+    # Velocity constraints for robust distance tracking
+    MIN_VELOCITY_THRESHOLD: float = 0.05  # Ignore velocities below this (noise)
+    MAX_VELOCITY_THRESHOLD: float = 10.0  # Reject velocities above this (unrealistic)
+    MAX_DT_SECONDS: float = 0.5  # Max time gap to integrate (reject gaps > 500ms)
+    
     def __init__(
         self,
         keyframe_interval_m: float = 2.0,
@@ -75,10 +80,15 @@ class KeyframeStackManager:
         # Distance tracking
         self.cumulative_distance: float = 0.0
         self.last_telemetry_time: Optional[int] = None
+        self._last_velocity: float = 0.0  # For smoothing/debugging
 
         # Scale calibration
         self.global_scale_factor: float = 1.0
         self._scale_factors: List[float] = []
+        
+        # Quality metrics
+        self._velocity_samples: List[float] = []
+        self._rejected_samples: int = 0
 
     def process_frame(
         self,
@@ -97,16 +107,47 @@ class KeyframeStackManager:
         Returns:
             New Keyframe if one was pushed, None otherwise.
         """
-        # Update cumulative distance from IMU velocity
+        # Update cumulative distance from IMU velocity with robustness checks
         if self.last_telemetry_time is not None:
             dt = (telemetry.timestamp_ms - self.last_telemetry_time) / 1000.0
-            if dt > 0:
-                velocity_magnitude = sqrt(
-                    telemetry.velocity_x ** 2
-                    + telemetry.velocity_y ** 2
-                    + telemetry.velocity_z ** 2
+            
+            # Compute velocity magnitude
+            velocity_magnitude = sqrt(
+                telemetry.velocity_x ** 2
+                + telemetry.velocity_y ** 2
+                + telemetry.velocity_z ** 2
+            )
+            
+            # Apply robustness checks
+            valid_sample = True
+            
+            # Check 1: Reject unrealistic time gaps (missed frames, reconnection)
+            if dt <= 0 or dt > self.MAX_DT_SECONDS:
+                logger.debug(f"Rejected dt={dt:.3f}s (outside valid range)")
+                valid_sample = False
+            
+            # Check 2: Reject unrealistically high velocities
+            if velocity_magnitude > self.MAX_VELOCITY_THRESHOLD:
+                logger.warning(
+                    f"Rejected velocity={velocity_magnitude:.2f}m/s "
+                    f"(exceeds {self.MAX_VELOCITY_THRESHOLD}m/s)"
                 )
-                self.cumulative_distance += velocity_magnitude * dt
+                self._rejected_samples += 1
+                valid_sample = False
+            
+            # Check 3: Filter out noise when nearly stationary
+            if velocity_magnitude < self.MIN_VELOCITY_THRESHOLD:
+                velocity_magnitude = 0.0  # Treat as stationary
+            
+            # Integrate if valid
+            if valid_sample and dt > 0:
+                distance_delta = velocity_magnitude * dt
+                self.cumulative_distance += distance_delta
+                self._last_velocity = velocity_magnitude
+                
+                # Track for quality metrics
+                if velocity_magnitude > 0:
+                    self._velocity_samples.append(velocity_magnitude)
 
         self.last_telemetry_time = telemetry.timestamp_ms
 
@@ -270,9 +311,58 @@ class KeyframeStackManager:
         self.stack.clear()
         self.cumulative_distance = 0.0
         self.last_telemetry_time = None
+        self._last_velocity = 0.0
         self.global_scale_factor = 1.0
         self._scale_factors.clear()
+        self._velocity_samples.clear()
+        self._rejected_samples = 0
         logger.info("Keyframe stack cleared")
+    
+    def get_velocity_stats(self) -> dict:
+        """
+        Get velocity statistics for quality assessment.
+        
+        Returns:
+            Dictionary with velocity statistics.
+        """
+        if not self._velocity_samples:
+            return {
+                "mean_velocity": 0.0,
+                "min_velocity": 0.0,
+                "max_velocity": 0.0,
+                "std_velocity": 0.0,
+                "num_samples": 0,
+                "rejected_samples": self._rejected_samples,
+                "quality": "no_data",
+            }
+        
+        samples = np.array(self._velocity_samples)
+        mean_vel = float(np.mean(samples))
+        std_vel = float(np.std(samples))
+        
+        # Assess quality based on velocity consistency
+        # Lower std relative to mean = more consistent = better
+        cv = std_vel / mean_vel if mean_vel > 0 else float('inf')  # Coefficient of variation
+        
+        if cv < 0.3 and 0.3 <= mean_vel <= 3.0:
+            quality = "excellent"
+        elif cv < 0.5 and 0.2 <= mean_vel <= 4.0:
+            quality = "good"
+        elif cv < 0.8:
+            quality = "acceptable"
+        else:
+            quality = "poor"
+        
+        return {
+            "mean_velocity": mean_vel,
+            "min_velocity": float(np.min(samples)),
+            "max_velocity": float(np.max(samples)),
+            "std_velocity": std_vel,
+            "coefficient_of_variation": cv,
+            "num_samples": len(samples),
+            "rejected_samples": self._rejected_samples,
+            "quality": quality,
+        }
 
     def get_keyframe_images(self) -> List[np.ndarray]:
         """Get all keyframe images."""
