@@ -63,6 +63,11 @@ class Config:
     # Frame Rate
     target_frame_rate_hz: float = 10.0
 
+    # Video Recording Settings
+    video_recording_enabled: bool = True
+    video_output_dir: str = "./videos"
+    video_fps: float = 10.0
+
 
 # Default configuration instance
 default_config = Config()

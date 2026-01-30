@@ -26,6 +26,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -33,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from visual_homing.protocol.messages import FrameMessage
 from visual_homing.server.config import Config
 from visual_homing.server.state_machine import StateMachine, SystemState
+from visual_homing.server.video_recorder import DualPhaseVideoRecorder
 from visual_homing.server.websocket_server import WebSocketServer
 
 logger = logging.getLogger(__name__)
@@ -46,7 +48,8 @@ class MockFrameProcessor:
     without requiring GPU/model loading.
     """
 
-    def __init__(self, save_sample_image: bool = True):
+    def __init__(self, save_sample_image: bool = True, config: Optional[Config] = None):
+        self.config = config or Config()
         self.state_machine = StateMachine()
         self.frame_count = 0
         self.keyframe_count = 0
@@ -54,6 +57,15 @@ class MockFrameProcessor:
         self.last_telemetry_time = None
         self.save_sample_image = save_sample_image
         self.image_validated = False
+        
+        # Initialize video recorder
+        self.video_recorder = DualPhaseVideoRecorder(
+            output_dir=self.config.video_output_dir,
+            fps=self.config.video_fps,
+            enabled=self.config.video_recording_enabled,
+        )
+        if self.config.video_recording_enabled:
+            logger.info(f"[Mock] Video recording enabled, output dir: {self.config.video_output_dir}")
 
     def _validate_image(self, frame: FrameMessage) -> bool:
         """Validate and optionally save received image."""
@@ -94,6 +106,9 @@ class MockFrameProcessor:
 
     def process_frame(self, frame: FrameMessage) -> dict:
         """Process frame and return mock response."""
+        import cv2
+        import numpy as np
+        
         self.frame_count += 1
 
         # Validate first 3 images to ensure protocol is working
@@ -111,6 +126,24 @@ class MockFrameProcessor:
             ) ** 0.5
             self.total_distance += speed * dt
         self.last_telemetry_time = frame.timestamp_ms
+
+        # Decode image for video recording
+        if self.video_recorder.is_recording:
+            try:
+                img_array = np.frombuffer(frame.image_data, dtype=np.uint8)
+                image = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                if image is not None:
+                    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                    if self.state_machine.is_recording():
+                        self.video_recorder.add_teach_frame(
+                            image_rgb, frame.timestamp_ms, frame.frame_id
+                        )
+                    elif self.state_machine.state == SystemState.HOMING:
+                        self.video_recorder.add_homing_frame(
+                            image_rgb, frame.timestamp_ms, frame.frame_id
+                        )
+            except Exception as e:
+                logger.debug(f"Video frame recording error: {e}")
 
         # Simulate keyframe capture during recording
         if self.state_machine.is_recording():
@@ -177,22 +210,39 @@ class MockFrameProcessor:
                 logger.info("Started recording")
                 self.keyframe_count = 0
                 self.total_distance = 0.0
+                # Start teach video recording
+                self.video_recorder.start_teach_recording()
             else:
                 logger.warning("Cannot start recording from current state")
 
         elif cmd_type == "stop_recording":
             if self.state_machine.stop_recording():
                 logger.info(f"Stopped recording: {self.keyframe_count} keyframes")
+                # Stop and save teach video
+                video_path = self.video_recorder.stop_teach_recording()
+                if video_path:
+                    logger.info(f"Teach video saved: {video_path}")
             else:
                 logger.warning("Cannot stop recording from current state")
 
         elif cmd_type == "start_homing":
             if self.state_machine.start_homing():
                 logger.info("Started homing")
+                # Start homing video recording
+                self.video_recorder.start_homing_recording()
             else:
                 logger.warning("Cannot start homing from current state")
 
+        elif cmd_type == "stop_homing":
+            # Stop and save homing video
+            video_path = self.video_recorder.stop_homing_recording()
+            if video_path:
+                logger.info(f"Homing video saved: {video_path}")
+
         elif cmd_type == "reset":
+            # Stop any active recording before reset
+            self.video_recorder.stop_teach_recording()
+            self.video_recorder.stop_homing_recording()
             self.state_machine.reset()
             self.frame_count = 0
             self.keyframe_count = 0
@@ -203,6 +253,20 @@ class MockFrameProcessor:
         """Get current system state."""
         return self.state_machine.state
 
+    def shutdown(self) -> None:
+        """Shutdown processor and finalize video recordings."""
+        logger.info("[Mock] Shutting down frame processor...")
+        
+        # Finalize any active video recordings
+        teach_path, homing_path = self.video_recorder.shutdown()
+        
+        if teach_path:
+            logger.info(f"[Mock] Teach video saved: {teach_path}")
+        if homing_path:
+            logger.info(f"[Mock] Homing video saved: {homing_path}")
+        
+        logger.info("[Mock] Frame processor shutdown complete")
+
 
 class ProductionFrameProcessor:
     """
@@ -211,13 +275,22 @@ class ProductionFrameProcessor:
     This integrates with the full HomingController for real operation.
     """
 
-    def __init__(self, config: Config = None):
+    def __init__(self, config: Optional[Config] = None):
         from visual_homing.server.homing_controller import HomingController
 
         self.config = config or Config()
         self.controller = HomingController(config=self.config)
         self.controller.initialize()
         logger.info("Fast3R model loaded and ready")
+        
+        # Initialize video recorder
+        self.video_recorder = DualPhaseVideoRecorder(
+            output_dir=self.config.video_output_dir,
+            fps=self.config.video_fps,
+            enabled=self.config.video_recording_enabled,
+        )
+        if self.config.video_recording_enabled:
+            logger.info(f"Video recording enabled, output dir: {self.config.video_output_dir}")
 
     def process_frame(self, frame: FrameMessage) -> dict:
         """Process frame through actual homing controller."""
@@ -250,12 +323,22 @@ class ProductionFrameProcessor:
         state = self.controller.get_state()
 
         if state == SystemState.RECORDING:
+            # Add frame to teach video (non-blocking)
+            self.video_recorder.add_teach_frame(
+                image, frame.timestamp_ms, frame.frame_id
+            )
+            
             keyframe = self.controller.process_teach_frame(image, telemetry)
             if keyframe:
                 logger.info(f"Keyframe captured: {self.controller.get_keyframe_count()}")
             return self._status_response()
 
         elif state == SystemState.HOMING:
+            # Add frame to homing video (non-blocking)
+            self.video_recorder.add_homing_frame(
+                image, frame.timestamp_ms, frame.frame_id
+            )
+            
             result = self.controller.process_homing_frame(image, telemetry)
             return {
                 "command": result.command,
@@ -277,17 +360,51 @@ class ProductionFrameProcessor:
         logger.info(f"Command received: {cmd_type}")
 
         if cmd_type == "start_recording":
-            self.controller.start_recording()
+            if self.controller.start_recording():
+                # Start teach video recording
+                self.video_recorder.start_teach_recording()
+                    
         elif cmd_type == "stop_recording":
-            self.controller.stop_recording()
+            if self.controller.stop_recording():
+                # Stop and save teach video
+                video_path = self.video_recorder.stop_teach_recording()
+                if video_path:
+                    logger.info(f"Teach video saved: {video_path}")
+                    
         elif cmd_type == "start_homing":
-            self.controller.start_homing()
+            if self.controller.start_homing():
+                # Start homing video recording
+                self.video_recorder.start_homing_recording()
+                    
+        elif cmd_type == "stop_homing":
+            # Stop and save homing video
+            video_path = self.video_recorder.stop_homing_recording()
+            if video_path:
+                logger.info(f"Homing video saved: {video_path}")
+                
         elif cmd_type == "reset":
+            # Stop any active recording before reset
+            self.video_recorder.stop_teach_recording()
+            self.video_recorder.stop_homing_recording()
             self.controller.reset()
 
     def get_state(self) -> SystemState:
         """Get current system state."""
         return self.controller.get_state()
+
+    def shutdown(self) -> None:
+        """Shutdown processor and finalize video recordings."""
+        logger.info("Shutting down frame processor...")
+        
+        # Finalize any active video recordings
+        teach_path, homing_path = self.video_recorder.shutdown()
+        
+        if teach_path:
+            logger.info(f"Teach video saved: {teach_path}")
+        if homing_path:
+            logger.info(f"Homing video saved: {homing_path}")
+        
+        logger.info("Frame processor shutdown complete")
 
     def _hover_response(self) -> dict:
         """Return hover command."""
@@ -317,14 +434,14 @@ async def run_server(
     host: str,
     port: int,
     mock: bool = False,
-    config: Config = None,
+    config: Optional[Config] = None,
 ) -> None:
     """Run the Visual Homing server."""
 
     # Create processor
     if mock:
         logger.info("Starting in MOCK mode (no Fast3R model)")
-        processor = MockFrameProcessor()
+        processor = MockFrameProcessor(config=config)
     else:
         logger.info("Starting in PRODUCTION mode (loading Fast3R model...)")
         processor = ProductionFrameProcessor(config)
@@ -382,6 +499,11 @@ async def run_server(
         pass
     finally:
         print("\nShutting down server...")
+        
+        # Shutdown processor (finalize videos)
+        if hasattr(processor, 'shutdown'):
+            processor.shutdown()
+        
         await server.stop()
         print("Server stopped.")
 

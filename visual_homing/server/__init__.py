@@ -9,6 +9,7 @@ from .state_machine import SystemState, StateMachine
 from .pid_controller import PIDController
 from .homing_controller import HomingController
 from .websocket_server import WebSocketServer
+from .video_recorder import AsyncVideoRecorder, DualPhaseVideoRecorder
 
 __all__ = [
     "Config",
@@ -23,6 +24,8 @@ __all__ = [
     "PIDController",
     "HomingController",
     "WebSocketServer",
+    "AsyncVideoRecorder",
+    "DualPhaseVideoRecorder",
 ]
 
 
