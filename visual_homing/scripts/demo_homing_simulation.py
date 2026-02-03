@@ -211,7 +211,7 @@ def simulate_homing(
         error_yaw = extract_yaw_error(R)
 
         # Distance to target
-        distance_to_target = np.linalg.norm(t_cam)
+        distance_to_target = float(np.linalg.norm(t_cam))
 
         # Check waypoint
         reached_waypoint = distance_to_target < waypoint_threshold_m
