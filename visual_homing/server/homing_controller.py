@@ -343,7 +343,7 @@ class HomingController:
         error_yaw = extract_yaw_error(R)
 
         # Compute distance to target
-        distance_to_target = np.linalg.norm(t_cam)
+        distance_to_target = float(np.linalg.norm(t_cam))
         
         # Check for low confidence
         low_confidence = pose_result.confidence < self.config.min_confidence

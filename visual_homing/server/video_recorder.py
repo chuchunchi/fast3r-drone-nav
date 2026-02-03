@@ -190,8 +190,18 @@ class DualPhaseVideoRecorder:
             return self._teach_video_path
         return None
     
-    def add_teach_frame(self, image: np.ndarray) -> bool:
-        """Add frame during TEACH phase."""
+    def add_teach_frame(
+        self,
+        image: np.ndarray,
+        timestamp_ms: Optional[int] = None,
+        frame_id: Optional[int] = None,
+    ) -> bool:
+        """
+        Add frame during TEACH phase.
+        
+        Note: `timestamp_ms` / `frame_id` are accepted for compatibility with
+        callers that pass frame metadata, but are not currently used.
+        """
         if self._teach_recorder and self._teach_recorder.is_recording:
             return self._teach_recorder.add_frame(image)
         return False
@@ -210,8 +220,18 @@ class DualPhaseVideoRecorder:
             return self._homing_video_path
         return None
     
-    def add_homing_frame(self, image: np.ndarray) -> bool:
-        """Add frame during HOMING phase."""
+    def add_homing_frame(
+        self,
+        image: np.ndarray,
+        timestamp_ms: Optional[int] = None,
+        frame_id: Optional[int] = None,
+    ) -> bool:
+        """
+        Add frame during HOMING phase.
+        
+        Note: `timestamp_ms` / `frame_id` are accepted for compatibility with
+        callers that pass frame metadata, but are not currently used.
+        """
         if self._homing_recorder and self._homing_recorder.is_recording:
             return self._homing_recorder.add_frame(image)
         return False
