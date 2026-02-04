@@ -338,19 +338,43 @@ class ProductionFrameProcessor:
             self.video_recorder.add_homing_frame(
                 image, frame.timestamp_ms, frame.frame_id
             )
-            
-            result = self.controller.process_homing_frame(image, telemetry)
-            return {
-                "command": result.command,
-                "status": {
-                    "state": result.state,
-                    "keyframes_remaining": result.keyframes_remaining,
-                    "target_distance_m": result.target_distance_m,
-                    "confidence": result.confidence,
-                    "total_keyframes": self.controller.get_keyframe_count(),
-                    "total_distance_m": self.controller.get_total_distance(),
-                },
-            }
+
+            # Check if enough time has passed to compute new command
+            if self.controller.should_compute_new_command():
+                # Compute new command
+                result = self.controller.process_homing_frame(image, telemetry)
+                logger.debug(f"Computed new command at frame {frame.frame_id}")
+                return {
+                    "command": result.command,
+                    "status": {
+                        "state": result.state,
+                        "keyframes_remaining": result.keyframes_remaining,
+                        "target_distance_m": result.target_distance_m,
+                        "confidence": result.confidence,
+                        "total_keyframes": self.controller.get_keyframe_count(),
+                        "total_distance_m": self.controller.get_total_distance(),
+                    },
+                }
+            else:
+                # Rate limited - send hover command
+                logger.debug(f"Rate limited at frame {frame.frame_id}, sending hover")
+                return {
+                    "command": {
+                        "pitch_velocity": 0.0,
+                        "roll_velocity": 0.0,
+                        "vertical_velocity": 0.0,
+                        "yaw_rate": 0.0,
+                        "duration_s": self.config.command_duration_s,
+                    },
+                    "status": {
+                        "state": state.name,
+                        "keyframes_remaining": self.controller.target_idx + 1 if self.controller.target_idx >= 0 else 0,
+                        "target_distance_m": 0.0,
+                        "confidence": 0.0,
+                        "total_keyframes": self.controller.get_keyframe_count(),
+                        "total_distance_m": self.controller.get_total_distance(),
+                    },
+                }
 
         else:
             return self._status_response()

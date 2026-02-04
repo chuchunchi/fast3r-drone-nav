@@ -1,6 +1,7 @@
 """Main homing controller integrating all components."""
 
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -61,12 +62,17 @@ class HomingController:
     Integrates:
     - Fast3R inference for 3D reconstruction
     - SVD Procrustes for pose estimation
-    - PID control for velocity generation
+    - Time-based control (fixed velocity, calculated duration)
     - Keyframe stack management
 
     Operates in two phases:
     1. TEACH: Record keyframes with IMU-based distance tracking
     2. REPEAT: Navigate back using visual matching
+
+    Control approach:
+    - Uses fixed velocity for stable, predictable flight
+    - Calculates duration based on distance: duration = distance / velocity
+    - Simple proportional control for yaw alignment
     """
 
     def __init__(
@@ -128,15 +134,25 @@ class HomingController:
         # Homing state
         self.target_idx: int = -1
         self.metric_scale: float = 1.0
-        
+
+        # Rate limiting for safety
+        self._last_command_time: float = 0.0
+
+        # Waypoint confirmation state
+        self._waypoint_confirm_count: int = 0
+
         # Statistics and debugging
         self.stats = HomingStats()
         self._consecutive_failures: int = 0
         self._max_consecutive_failures: int = 10  # Skip keyframe after 10 failures
-        
+
         # Last pose result for debugging
         self._last_pose_result: Optional[PoseResult] = None
         self._last_translation: Optional[np.ndarray] = None
+
+        # Stuck detection - skip keyframe if distance doesn't decrease
+        self._last_distance: float = float('inf')
+        self._frames_without_progress: int = 0
 
     def initialize(self) -> None:
         """Initialize the controller (load model, etc.)."""
@@ -246,10 +262,52 @@ class HomingController:
         self._consecutive_failures = 0
         self._last_pose_result = None
         self._last_translation = None
+        self._last_command_time = 0.0
+        self._waypoint_confirm_count = 0
+        self._last_distance = float('inf')
+        self._frames_without_progress = 0
 
         logger.info(f"Starting homing with {self.target_idx + 1} keyframes")
         logger.info(f"Metric scale: {self.metric_scale:.4f}")
         return True
+
+    def should_compute_new_command(self) -> bool:
+        """
+        Check if enough time has passed to compute a new command.
+
+        Returns:
+            True if a new command should be computed, False if should send hover.
+        """
+        if self._last_command_time == 0.0:
+            return True  # First command
+
+        elapsed = time.time() - self._last_command_time
+        return elapsed >= self.config.command_update_interval_s
+
+    def _clamp_total_velocity(self, command: Dict[str, float]) -> Dict[str, float]:
+        """
+        Clamp total translational velocity magnitude to max_total_velocity.
+
+        Prevents dangerous diagonal speeds where individual axis limits
+        would allow e.g. forward=1.0 + lateral=1.0 = 1.41 m/s total.
+        """
+        vx = command["pitch_velocity"]
+        vy = command["roll_velocity"]
+        vz = command["vertical_velocity"]
+        magnitude = math.sqrt(vx ** 2 + vy ** 2 + vz ** 2)
+
+        max_total = self.config.max_total_velocity
+        if magnitude > max_total and magnitude > 0:
+            scale = max_total / magnitude
+            command["pitch_velocity"] *= scale
+            command["roll_velocity"] *= scale
+            command["vertical_velocity"] *= scale
+            logger.debug(
+                f"Velocity magnitude {magnitude:.2f} m/s exceeded limit "
+                f"{max_total:.2f} m/s, scaled down by {scale:.2f}"
+            )
+
+        return command
 
     def process_homing_frame(
         self,
@@ -257,7 +315,12 @@ class HomingController:
         telemetry: Telemetry,
     ) -> HomingResult:
         """
-        Process a frame during HOMING phase.
+        Process a frame during HOMING phase with simple rate limiting.
+
+        Each iteration:
+        1. Computes fresh command from current frame
+        2. Adds command duration for drone execution
+        3. Sleeps for command_update_interval_s before returning
 
         Args:
             live_frame: Current camera frame (RGB).
@@ -267,7 +330,7 @@ class HomingController:
             HomingResult with command and status.
         """
         self.stats.total_frames += 1
-        
+
         # Check if homing is complete
         if self.target_idx < 0:
             self.state_machine.complete_homing()
@@ -361,36 +424,158 @@ class HomingController:
             self._consecutive_failures = 0  # Reset failure counter on success
             velocity_scale = 1.0
 
-        # Check if we've reached the waypoint
-        if distance_to_target < self.config.waypoint_threshold_m:
-            self._advance_to_next_keyframe()
-            self.stats.waypoints_reached += 1
+        # Check if we've reached the waypoint (with confirmation)
+        if distance_to_target < self.config.waypoint_threshold_m and not low_confidence:
+            self._waypoint_confirm_count += 1
+            logger.info(
+                f"Waypoint proximity: {distance_to_target:.2f}m < "
+                f"{self.config.waypoint_threshold_m}m "
+                f"(confirm {self._waypoint_confirm_count}/{self.config.waypoint_confirm_frames})"
+            )
+            if self._waypoint_confirm_count >= self.config.waypoint_confirm_frames:
+                self._advance_to_next_keyframe()
+                self.stats.waypoints_reached += 1
+        else:
+            # Reset confirmation counter if we're not within threshold
+            if self._waypoint_confirm_count > 0:
+                logger.debug(f"Waypoint confirmation reset: distance={distance_to_target:.2f}m")
+            self._waypoint_confirm_count = 0
 
-        # PID control
-        command = self.pid.compute(
-            error_forward,
-            error_lateral,
-            error_vertical,
-            error_yaw,
+        # Stuck detection: check if making progress toward target
+        # Use a more lenient check: if distance improved OR stayed roughly same (within 20%)
+        distance_tolerance = self._last_distance * 0.2  # Allow 20% variation
+
+        if distance_to_target < self._last_distance - self.config.progress_threshold_m:
+            # Clear progress, reset counter
+            self._frames_without_progress = 0
+            self._last_distance = distance_to_target
+            logger.debug(f"Progress: distance reduced to {distance_to_target:.2f}m")
+        elif distance_to_target <= self._last_distance + distance_tolerance:
+            # Distance stayed roughly the same or slightly worse, but acceptable
+            # This happens with single-axis control when addressing one error at a time
+            # Don't reset counter, but don't increment aggressively
+            if self._frames_without_progress < self.config.max_frames_without_progress // 2:
+                # Only increment slowly in the first half
+                self._frames_without_progress += 1
+        else:
+            # Distance significantly worse
+            self._frames_without_progress += 1
+            logger.debug(
+                f"No progress: dist={distance_to_target:.2f}m, "
+                f"last={self._last_distance:.2f}m, "
+                f"frames={self._frames_without_progress}/{self.config.max_frames_without_progress}"
+            )
+
+            # Skip keyframe if stuck too long
+            if self._frames_without_progress >= self.config.max_frames_without_progress:
+                logger.warning(
+                    f"Stuck on keyframe {self.target_idx} for {self._frames_without_progress} frames, "
+                    f"distance not decreasing (current={distance_to_target:.2f}m, "
+                    f"best={self._last_distance:.2f}m). Skipping keyframe."
+                )
+                self._advance_to_next_keyframe()
+                return HomingResult(
+                    state="HOMING",
+                    command=create_hover_command(),
+                    target_distance_m=distance_to_target,
+                    keyframes_remaining=self.target_idx + 1,
+                    confidence=pose_result.confidence,
+                    pose_result=pose_result,
+                    low_confidence=low_confidence,
+                    inference_time_ms=inference_time_ms,
+                )
+
+        # Single-axis control: move only in one direction at a time
+        # This provides more stable and predictable flight
+
+        # Find the axis with largest error
+        errors_abs = [abs(error_forward), abs(error_lateral), abs(error_vertical)]
+        max_error_idx = np.argmax(errors_abs)
+        max_error = errors_abs[max_error_idx]
+
+        # Define minimum error threshold for movement
+        min_error_threshold = 0.1  # 10cm
+
+        if max_error > min_error_threshold:
+            # Move only on the axis with largest error
+            velocity_vector = np.zeros(3)
+
+            # Set velocity for the dominant axis
+            fixed_vel = self.config.fixed_flight_velocity * velocity_scale
+
+            if max_error_idx == 0:  # Forward/backward
+                velocity_vector[0] = fixed_vel if error_forward > 0 else -fixed_vel
+                axis_name = "forward" if error_forward > 0 else "backward"
+            elif max_error_idx == 1:  # Lateral (left/right)
+                velocity_vector[1] = fixed_vel if error_lateral > 0 else -fixed_vel
+                axis_name = "right" if error_lateral > 0 else "left"
+            else:  # Vertical (up/down)
+                velocity_vector[2] = fixed_vel if error_vertical > 0 else -fixed_vel
+                axis_name = "up" if error_vertical > 0 else "down"
+
+            # Calculate duration to reach target on this axis
+            # duration = distance / velocity
+            calculated_duration = max_error / fixed_vel
+            # Clamp duration to reasonable range
+            duration = max(0.5, min(calculated_duration, self.config.command_duration_s))
+
+            logger.debug(f"Single-axis: moving {axis_name}, error={max_error:.2f}m, dur={duration:.1f}s")
+        else:
+            # All errors below threshold, hover
+            velocity_vector = np.zeros(3)
+            duration = 0.5
+            logger.debug("All axes below threshold, hovering")
+
+        # Simple proportional control for yaw
+        yaw_rate = self.config.pid_yaw_kp * error_yaw
+        yaw_rate = np.clip(yaw_rate, -self.config.max_yaw_rate, self.config.max_yaw_rate)
+
+        # Build command (DJI coordinate system)
+        command = {
+            "pitch_velocity": float(velocity_vector[0]),  # forward
+            "roll_velocity": float(velocity_vector[1]),   # lateral
+            "vertical_velocity": float(velocity_vector[2]),  # vertical
+            "yaw_rate": float(yaw_rate),
+        }
+
+        # Apply safety clamps to individual axes
+        command["pitch_velocity"] = np.clip(
+            command["pitch_velocity"],
+            -self.config.max_forward_velocity,
+            self.config.max_forward_velocity
         )
-        
-        # Apply velocity scaling for low confidence
-        if velocity_scale < 1.0:
-            command = {
-                k: v * velocity_scale for k, v in command.items()
-            }
-        
+        command["roll_velocity"] = np.clip(
+            command["roll_velocity"],
+            -self.config.max_lateral_velocity,
+            self.config.max_lateral_velocity
+        )
+        command["vertical_velocity"] = np.clip(
+            command["vertical_velocity"],
+            -self.config.max_vertical_velocity,
+            self.config.max_vertical_velocity
+        )
+
+        # Clamp total translational velocity magnitude
+        command = self._clamp_total_velocity(command)
+
+        # Add calculated duration for drone to execute this command
+        command["duration_s"] = duration
+
         # Store command in history (for debugging/visualization)
         self.stats.command_history.append(command.copy())
-        
-        # Log periodically
-        if self.stats.total_frames % 10 == 0:
-            logger.debug(
-                f"Frame {self.stats.total_frames}: "
-                f"target={self.target_idx}, dist={distance_to_target:.2f}m, "
-                f"conf={pose_result.confidence:.2f}, "
-                f"cmd=[{command['pitch_velocity']:.2f}, {command['roll_velocity']:.2f}]"
-            )
+
+        # Log
+        logger.info(
+            f"Frame {self.stats.total_frames}: "
+            f"target={self.target_idx}, dist={distance_to_target:.2f}m, "
+            f"conf={pose_result.confidence:.2f}, "
+            f"cmd=[fwd={command['pitch_velocity']:.2f}, lat={command['roll_velocity']:.2f}, "
+            f"vert={command['vertical_velocity']:.2f}, yaw={command['yaw_rate']:.1f}, "
+            f"dur={command['duration_s']:.1f}s]"
+        )
+
+        # Update last command time for rate limiting (handled by caller)
+        self._last_command_time = time.time()
 
         return HomingResult(
             state="HOMING",
@@ -412,6 +597,14 @@ class HomingController:
 
         self.target_idx -= 1
         self.pid.reset_position()  # Reset position PIDs, keep yaw
+
+        # Reset waypoint confirmation for new target
+        self._waypoint_confirm_count = 0
+
+        # Reset stuck detection for new target
+        self._last_distance = float('inf')
+        self._frames_without_progress = 0
+        self._consecutive_failures = 0
 
         if self.target_idx < 0:
             logger.info("All keyframes reached, homing complete!")
@@ -449,6 +642,10 @@ class HomingController:
         self._consecutive_failures = 0
         self._last_pose_result = None
         self._last_translation = None
+        self._last_command_time = 0.0
+        self._waypoint_confirm_count = 0
+        self._last_distance = float('inf')
+        self._frames_without_progress = 0
         logger.info("Homing controller reset")
 
     def emergency_stop(self) -> Dict[str, float]:
@@ -473,6 +670,7 @@ class HomingController:
         info = {
             "state": self.state_machine.state.name,
             "target_idx": self.target_idx,
+            "waypoint_confirm_count": self._waypoint_confirm_count,
             "keyframe_count": len(self.keyframe_manager),
             "total_distance_m": self.keyframe_manager.get_total_distance(),
             "metric_scale": self.metric_scale,

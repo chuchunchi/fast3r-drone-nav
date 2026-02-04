@@ -12,8 +12,11 @@ This simulates what happens during actual homing without requiring
 a real drone connection.
 
 Usage:
-    # Full simulation with visualization:
+    # Full simulation with visualization (simulates complete homing):
     python demo_homing_simulation.py --folder demo_examples/target1 --visualize
+
+    # Single image mode (test where one image should go):
+    python demo_homing_simulation.py --folder demo_examples/target1 --single-image
 
     # Quick test:
     python demo_homing_simulation.py --folder demo_examples/target1
@@ -131,10 +134,11 @@ def simulate_homing(
     config: Config,
     metric_scale: float = 1.0,
     waypoint_threshold_m: float = 0.8,
+    single_image_mode: bool = False,
 ) -> List[HomingStep]:
     """
     Simulate the homing loop.
-    
+
     Args:
         live_images: List of (name, image) tuples for "live" frames.
         keyframe_manager: Manager with recorded keyframes.
@@ -142,7 +146,8 @@ def simulate_homing(
         config: Configuration.
         metric_scale: Scale factor (meters per Fast3R unit).
         waypoint_threshold_m: Distance to consider waypoint reached.
-    
+        single_image_mode: If True, use only the first live image for all steps.
+
     Returns:
         List of HomingStep results.
     """
@@ -167,12 +172,100 @@ def simulate_homing(
 
     target_idx = keyframe_manager.get_stack_size() - 1
     results = []
+    live_image_idx = 0
 
-    for step_idx, (img_name, live_frame) in enumerate(live_images):
+    # In single image mode, we test one live image against all keyframes
+    if single_image_mode:
+        if len(live_images) == 0:
+            return results
+        live_name, live_frame = live_images[0]
+
+        # Test against all keyframes from end to start
+        for step_idx in range(keyframe_manager.get_stack_size()):
+            target_keyframe = keyframe_manager[target_idx]
+
+            # Run Fast3R inference
+            result = fast3r.infer_pair(live_frame, target_keyframe.image)
+
+            # Estimate pose
+            pose_result = pose_estimator.estimate_pose(
+                result["pts3d_1"],  # Live frame points
+                result["pts3d_2"],  # Target frame points
+                result["conf_1"],  # Live frame confidence
+            )
+
+            if not pose_result.success:
+                logger.warning(f"Step {step_idx}: Pose estimation failed for KF{target_idx}")
+                results.append(HomingStep(
+                    step_idx=step_idx,
+                    live_image_name=live_name,
+                    target_keyframe_idx=target_idx,
+                    target_distance_m=float("inf"),
+                    pose_result=pose_result,
+                    command=create_hover_command(),
+                    translation_cam=np.zeros(3),
+                    yaw_error_deg=0.0,
+                    reached_waypoint=False,
+                ))
+                target_idx -= 1
+                continue
+
+            # Extract pose error in camera frame
+            t_cam = pose_result.translation.cpu().numpy()
+            R = pose_result.rotation
+
+            # Camera frame: X=right, Y=down, Z=forward
+            error_forward = float(t_cam[2])
+            error_lateral = float(t_cam[0])
+            error_vertical = -float(t_cam[1])  # Invert: down→up
+            error_yaw = extract_yaw_error(R)
+
+            # Distance to target
+            distance_to_target = float(np.linalg.norm(t_cam))
+
+            # Check waypoint
+            reached_waypoint = distance_to_target < waypoint_threshold_m
+
+            # PID control
+            command = pid.compute(
+                error_forward,
+                error_lateral,
+                error_vertical,
+                error_yaw,
+            )
+
+            results.append(HomingStep(
+                step_idx=step_idx,
+                live_image_name=live_name,
+                target_keyframe_idx=target_idx,
+                target_distance_m=distance_to_target,
+                pose_result=pose_result,
+                command=command,
+                translation_cam=t_cam,
+                yaw_error_deg=error_yaw,
+                reached_waypoint=reached_waypoint,
+            ))
+
+            if reached_waypoint:
+                logger.info(f"Step {step_idx}: Would reach keyframe {target_idx}")
+
+            target_idx -= 1
+            pid.reset_position()
+
+        return results
+
+    # Standard mode: simulate actual homing with progressing live images
+    for step_idx in range(len(live_images)):
         if target_idx < 0:
             logger.info("Homing complete - all keyframes reached")
             break
 
+        # Use the corresponding live image for this step
+        if live_image_idx >= len(live_images):
+            logger.info("No more live images available")
+            break
+
+        img_name, live_frame = live_images[live_image_idx]
         target_keyframe = keyframe_manager[target_idx]
 
         # Run Fast3R inference
@@ -198,6 +291,7 @@ def simulate_homing(
                 yaw_error_deg=0.0,
                 reached_waypoint=False,
             ))
+            live_image_idx += 1
             continue
 
         # Extract pose error in camera frame
@@ -241,14 +335,63 @@ def simulate_homing(
             target_idx -= 1
             pid.reset_position()
 
+        # Always advance to next live image in standard mode
+        live_image_idx += 1
+
     return results
 
 
-def print_homing_results(results: List[HomingStep]):
+def get_direction_description(translation_cam: np.ndarray, yaw_error: float) -> str:
+    """
+    Get human-readable direction description from camera-frame translation.
+
+    Args:
+        translation_cam: Translation vector in camera frame [X=right, Y=down, Z=forward]
+        yaw_error: Yaw error in degrees
+
+    Returns:
+        Description string like "Move forward 2.5m, left 0.3m, turn right 15°"
+    """
+    # Camera frame convention: X=right, Y=down, Z=forward
+    x, y, z = translation_cam
+
+    parts = []
+
+    # Forward/backward (Z axis)
+    if abs(z) > 0.05:  # Threshold for meaningful movement
+        direction = "forward" if z > 0 else "backward"
+        parts.append(f"{direction} {abs(z):.2f}m")
+
+    # Left/right (X axis)
+    if abs(x) > 0.05:
+        direction = "right" if x > 0 else "left"
+        parts.append(f"{direction} {abs(x):.2f}m")
+
+    # Up/down (Y axis, inverted)
+    if abs(y) > 0.05:
+        direction = "down" if y > 0 else "up"
+        parts.append(f"{direction} {abs(y):.2f}m")
+
+    # Yaw
+    if abs(yaw_error) > 2.0:  # Threshold for meaningful rotation
+        direction = "right" if yaw_error > 0 else "left"
+        parts.append(f"turn {direction} {abs(yaw_error):.1f}°")
+
+    if not parts:
+        return "At target position"
+
+    return "Move " + ", ".join(parts)
+
+
+def print_homing_results(results: List[HomingStep], single_image_mode: bool = False):
     """Print homing simulation results."""
     print("\n" + "=" * 80)
     print("HOMING SIMULATION RESULTS")
     print("=" * 80)
+
+    if single_image_mode:
+        print("\n[SINGLE IMAGE MODE] Testing one live image against all keyframes")
+        print("This shows which keyframe the live image is closest to.\n")
 
     print("\nPose Estimation & Control Commands:")
     print("-" * 80)
@@ -284,10 +427,32 @@ def print_homing_results(results: List[HomingStep]):
         print(f"  Average target distance: {avg_distance:.3f}m")
 
         avg_confidence = np.mean([
-            r.pose_result.confidence for r in results 
+            r.pose_result.confidence for r in results
             if r.pose_result and r.pose_result.success
         ])
         print(f"  Average confidence: {avg_confidence:.3f}")
+
+    # Find best match and show directions
+    if single_image_mode and results:
+        valid_results = [r for r in results if r.target_distance_m < float("inf")]
+        if valid_results:
+            best_match = min(valid_results, key=lambda r: r.target_distance_m)
+            print(f"\n" + "=" * 80)
+            print("RECOMMENDED ACTION")
+            print("=" * 80)
+            print(f"Closest match: Keyframe {best_match.target_keyframe_idx}")
+            print(f"Distance: {best_match.target_distance_m:.3f}m")
+            print(f"Confidence: {best_match.pose_result.confidence:.3f}")
+            print(f"\nTo reach this keyframe:")
+            direction_desc = get_direction_description(best_match.translation_cam, best_match.yaw_error_deg)
+            print(f"  → {direction_desc}")
+
+            # Show translation components
+            print(f"\nDetailed translation (camera frame):")
+            print(f"  Forward (Z):  {best_match.translation_cam[2]:+.3f}m {'(target ahead)' if best_match.translation_cam[2] > 0 else '(target behind)'}")
+            print(f"  Lateral (X):  {best_match.translation_cam[0]:+.3f}m {'(target to right)' if best_match.translation_cam[0] > 0 else '(target to left)'}")
+            print(f"  Vertical (Y): {-best_match.translation_cam[1]:+.3f}m {'(target above)' if -best_match.translation_cam[1] > 0 else '(target below)'}")
+            print(f"  Yaw error:    {best_match.yaw_error_deg:+.1f}° {'(turn right)' if best_match.yaw_error_deg > 0 else '(turn left)'}")
 
 
 def visualize_homing(
@@ -496,6 +661,11 @@ def main():
         default=0.5,
         help="Simulated distance between keyframes (meters)",
     )
+    parser.add_argument(
+        "--single-image",
+        action="store_true",
+        help="Single image mode: test one live image against all keyframes",
+    )
 
     args = parser.parse_args()
 
@@ -528,6 +698,8 @@ def main():
     print(f"\nInput images: {len(image_paths)}")
     print(f"Metric scale: {args.scale}")
     print(f"Waypoint threshold: {args.waypoint_threshold}m")
+    if args.single_image:
+        print(f"Mode: Single image test (using last image in sequence)")
 
     # Step 1: Build keyframe stack (simulating TEACH phase)
     print("\n[Step 1] Building keyframe stack...")
@@ -541,12 +713,21 @@ def main():
     fast3r.load_model()
 
     # Step 3: Simulate homing
-    # Use images in reverse order as "live" frames (simulating return flight)
     print("\n[Step 3] Simulating homing...")
-    live_images = [
-        (p.name, load_image(str(p))) 
-        for p in reversed(image_paths)
-    ]
+
+    if args.single_image:
+        # Single image mode: use only the last image (first position in reversed order)
+        live_images = [
+            (image_paths[-1].name, load_image(str(image_paths[-1])))
+        ]
+        print(f"  Testing live image: {image_paths[-1].name}")
+    else:
+        # Standard mode: use images in reverse order as "live" frames
+        live_images = [
+            (p.name, load_image(str(p)))
+            for p in reversed(image_paths)
+        ]
+        print(f"  Using {len(live_images)} live images")
 
     results = simulate_homing(
         live_images=live_images,
@@ -555,10 +736,11 @@ def main():
         config=config,
         metric_scale=args.scale,
         waypoint_threshold_m=args.waypoint_threshold,
+        single_image_mode=args.single_image,
     )
 
     # Step 4: Print results
-    print_homing_results(results)
+    print_homing_results(results, single_image_mode=args.single_image)
 
     # Step 5: Visualization
     if args.visualize:

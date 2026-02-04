@@ -77,10 +77,11 @@ class TestConfig:
         """Test velocity limit defaults."""
         config = Config()
 
-        assert config.max_forward_velocity == 2.0
-        assert config.max_lateral_velocity == 2.0
-        assert config.max_vertical_velocity == 1.0
-        assert config.max_yaw_rate == 30.0
+        assert config.max_forward_velocity == 0.5
+        assert config.max_lateral_velocity == 0.5
+        assert config.max_vertical_velocity == 0.2
+        assert config.max_yaw_rate == 20.0
+        assert config.max_total_velocity == 0.6
 
     def test_safety_settings(self):
         """Test safety setting defaults."""
@@ -90,6 +91,19 @@ class TestConfig:
         assert config.max_path_deviation_factor == 1.5
         assert config.min_battery_percent == 25.0
         assert config.max_height_deviation_m == 2.0
+
+    def test_rate_limiting_settings(self):
+        """Test command rate limiting defaults."""
+        config = Config()
+
+        assert config.command_update_interval_s == 0.5
+        assert config.command_duration_s == 0.5
+
+    def test_waypoint_confirmation_settings(self):
+        """Test waypoint confirmation defaults."""
+        config = Config()
+
+        assert config.waypoint_confirm_frames == 2
 
     def test_communication_settings(self):
         """Test communication setting defaults."""

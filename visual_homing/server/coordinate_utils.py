@@ -171,13 +171,18 @@ def fast3r_to_dji_command(
     return cmd
 
 
-def create_hover_command() -> Dict[str, float]:
-    """Create a hover command (zero velocities)."""
+def create_hover_command(duration_s: float = 0.0) -> Dict[str, float]:
+    """Create a hover command (zero velocities).
+
+    Args:
+        duration_s: How long this command should be executed (seconds).
+    """
     return {
         "pitch_velocity": 0.0,
         "roll_velocity": 0.0,
         "vertical_velocity": 0.0,
         "yaw_rate": 0.0,
+        "duration_s": duration_s,
     }
 
 
