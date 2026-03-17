@@ -1,9 +1,11 @@
 """Keyframe stack management for teach-and-repeat navigation."""
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 from math import sqrt
+from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -380,5 +382,68 @@ class KeyframeStackManager:
 
     def __getitem__(self, idx: int) -> Keyframe:
         return self.stack[idx]
+
+    def save_metadata(self, output_dir: Path) -> None:
+        """
+        Save keyframe metadata including metric scale to JSON file.
+
+        Args:
+            output_dir: Directory to save metadata (e.g., 'videos/teach_target')
+        """
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        metadata = {
+            "num_keyframes": len(self.stack),
+            "total_distance_m": self.cumulative_distance,
+            "global_scale_factor": self.global_scale_factor,
+            "keyframe_interval_m": self.keyframe_interval_m,
+            "keyframe_interval_s": self.keyframe_interval_s,
+            "keyframes": [
+                {
+                    "index": kf.index,
+                    "cumulative_distance_m": kf.cumulative_distance,
+                    "timestamp_ms": kf.timestamp_ms,
+                    "scale_factor": kf.scale_factor,
+                }
+                for kf in self.stack
+            ],
+            "velocity_stats": self.get_velocity_stats(),
+        }
+
+        metadata_path = output_dir / "keyframe_metadata.json"
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+
+        logger.info(f"Saved keyframe metadata to {metadata_path}")
+        logger.info(f"  Keyframes: {len(self.stack)}")
+        logger.info(f"  Total distance: {self.cumulative_distance:.2f}m")
+        logger.info(f"  Global scale factor: {self.global_scale_factor:.4f}")
+
+    @staticmethod
+    def load_metadata(input_dir: Path) -> dict:
+        """
+        Load keyframe metadata from JSON file.
+
+        Args:
+            input_dir: Directory containing metadata file
+
+        Returns:
+            Metadata dictionary with scale factor and other info
+        """
+        input_dir = Path(input_dir)
+        metadata_path = input_dir / "keyframe_metadata.json"
+
+        if not metadata_path.exists():
+            logger.warning(f"No metadata file found at {metadata_path}")
+            return {"global_scale_factor": 1.0}
+
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        logger.info(f"Loaded keyframe metadata from {metadata_path}")
+        logger.info(f"  Global scale factor: {metadata.get('global_scale_factor', 1.0):.4f}")
+
+        return metadata
 
 

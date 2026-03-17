@@ -271,26 +271,27 @@ class MockFrameProcessor:
 class ProductionFrameProcessor:
     """
     Production frame processor using actual Fast3R model.
-    
+
     This integrates with the full HomingController for real operation.
     """
 
     def __init__(self, config: Optional[Config] = None):
         from visual_homing.server.homing_controller import HomingController
+        from visual_homing.server.flight_session import FlightSession
 
         self.config = config or Config()
         self.controller = HomingController(config=self.config)
         self.controller.initialize()
         logger.info("Fast3R model loaded and ready")
-        
-        # Initialize video recorder
-        self.video_recorder = DualPhaseVideoRecorder(
-            output_dir=self.config.video_output_dir,
-            fps=self.config.video_fps,
-            enabled=self.config.video_recording_enabled,
-        )
+
+        # Initialize flight session manager
+        self.flight_session = FlightSession(base_dir=self.config.video_output_dir)
+
+        # Initialize video recorder (will be reconfigured when session starts)
+        self.video_recorder = None
+
         if self.config.video_recording_enabled:
-            logger.info(f"Video recording enabled, output dir: {self.config.video_output_dir}")
+            logger.info(f"Flight sessions will be saved to: {self.config.video_output_dir}")
 
     def process_frame(self, frame: FrameMessage) -> dict:
         """Process frame through actual homing controller."""
@@ -324,13 +325,18 @@ class ProductionFrameProcessor:
 
         if state == SystemState.RECORDING:
             # Add frame to teach video (non-blocking)
-            self.video_recorder.add_teach_frame(
-                image, frame.timestamp_ms, frame.frame_id
-            )
-            
+            if self.video_recorder:
+                self.video_recorder.add_teach_frame(
+                    image, frame.timestamp_ms, frame.frame_id
+                )
+
+            # Process frame and save keyframe image if captured
             keyframe = self.controller.process_teach_frame(image, telemetry)
             if keyframe:
-                logger.info(f"Keyframe captured: {self.controller.get_keyframe_count()}")
+                # Save keyframe image to session folder
+                self.flight_session.save_keyframe_image(image, keyframe.index)
+                logger.info(f"Keyframe {keyframe.index} captured and saved")
+
             return self._status_response()
 
         elif state == SystemState.HOMING:
@@ -385,31 +391,88 @@ class ProductionFrameProcessor:
 
         if cmd_type == "start_recording":
             if self.controller.start_recording():
-                # Start teach video recording
-                self.video_recorder.start_teach_recording()
-                    
+                # Start a new flight session
+                session_dir = self.flight_session.start_session()
+                logger.info(f"Started new flight session: {session_dir}")
+
+                # Create video recorder for this session
+                if self.config.video_recording_enabled:
+                    self.video_recorder = DualPhaseVideoRecorder(
+                        output_dir=str(session_dir),
+                        fps=self.config.video_fps,
+                        enabled=True,
+                    )
+                    self.video_recorder.start_teach_recording()
+
+                # Save config to session
+                config_dict = {
+                    "keyframe_interval_m": self.config.keyframe_interval_m,
+                    "keyframe_interval_s": self.config.keyframe_interval_s,
+                    "waypoint_threshold_m": self.config.waypoint_threshold_m,
+                    "fixed_flight_velocity": self.config.fixed_flight_velocity,
+                    "min_confidence": self.config.min_confidence,
+                }
+                self.flight_session.save_config(config_dict)
+
         elif cmd_type == "stop_recording":
-            if self.controller.stop_recording():
-                # Stop and save teach video
+            # Stop controller recording (computes scale)
+            self.controller.stop_recording()
+
+            # Stop and save teach video
+            if self.video_recorder:
                 video_path = self.video_recorder.stop_teach_recording()
                 if video_path:
                     logger.info(f"Teach video saved: {video_path}")
-                    
+
+            # Save teach metadata to session
+            self.flight_session.save_teach_metadata(
+                num_keyframes=self.controller.get_keyframe_count(),
+                total_distance_m=self.controller.get_total_distance(),
+                global_scale_factor=self.controller.metric_scale,
+                keyframe_distances=self.controller.keyframe_manager.get_keyframe_distances(),
+                velocity_stats=self.controller.keyframe_manager.get_velocity_stats(),
+            )
+
+            logger.info(f"Teaching phase metadata saved")
+
         elif cmd_type == "start_homing":
             if self.controller.start_homing():
                 # Start homing video recording
-                self.video_recorder.start_homing_recording()
-                    
+                if self.video_recorder:
+                    self.video_recorder.start_homing_recording()
+
         elif cmd_type == "stop_homing":
+            # Save homing metadata
+            stats = self.controller.get_stats()
+            self.flight_session.save_homing_metadata(
+                total_frames=stats.total_frames,
+                successful_poses=stats.successful_poses,
+                failed_poses=stats.failed_poses,
+                waypoints_reached=stats.waypoints_reached,
+                avg_inference_time_ms=stats.avg_inference_time_ms,
+                success_rate=stats.success_rate,
+            )
+
             # Stop and save homing video
-            video_path = self.video_recorder.stop_homing_recording()
-            if video_path:
-                logger.info(f"Homing video saved: {video_path}")
-                
+            if self.video_recorder:
+                video_path = self.video_recorder.stop_homing_recording()
+                if video_path:
+                    logger.info(f"Homing video saved: {video_path}")
+
+            # Finalize session
+            self.flight_session.finalize_session()
+            logger.info(f"Flight session finalized: {self.flight_session.get_session_folder()}")
+
         elif cmd_type == "reset":
             # Stop any active recording before reset
-            self.video_recorder.stop_teach_recording()
-            self.video_recorder.stop_homing_recording()
+            if self.video_recorder:
+                self.video_recorder.stop_teach_recording()
+                self.video_recorder.stop_homing_recording()
+
+            # Finalize current session if any
+            if self.flight_session.get_session_folder():
+                self.flight_session.finalize_session()
+
             self.controller.reset()
 
     def get_state(self) -> SystemState:
@@ -417,17 +480,23 @@ class ProductionFrameProcessor:
         return self.controller.get_state()
 
     def shutdown(self) -> None:
-        """Shutdown processor and finalize video recordings."""
+        """Shutdown processor and finalize session."""
         logger.info("Shutting down frame processor...")
-        
+
         # Finalize any active video recordings
-        teach_path, homing_path = self.video_recorder.shutdown()
-        
-        if teach_path:
-            logger.info(f"Teach video saved: {teach_path}")
-        if homing_path:
-            logger.info(f"Homing video saved: {homing_path}")
-        
+        if self.video_recorder:
+            teach_path, homing_path = self.video_recorder.shutdown()
+
+            if teach_path:
+                logger.info(f"Teach video saved: {teach_path}")
+            if homing_path:
+                logger.info(f"Homing video saved: {homing_path}")
+
+        # Finalize flight session if active
+        if self.flight_session.get_session_folder():
+            self.flight_session.finalize_session()
+            logger.info(f"Session finalized: {self.flight_session.get_session_folder()}")
+
         logger.info("Frame processor shutdown complete")
 
     def _hover_response(self) -> dict:

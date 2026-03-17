@@ -191,9 +191,12 @@ class HomingController:
 
         return self.keyframe_manager.process_frame(frame, telemetry)
 
-    def stop_recording(self) -> bool:
+    def stop_recording(self, save_metadata_to: Optional[str] = None) -> bool:
         """
         Stop recording and compute scale factors.
+
+        Args:
+            save_metadata_to: Optional directory to save keyframe metadata (e.g., 'videos/teach_target')
 
         Returns:
             True if successful.
@@ -203,6 +206,11 @@ class HomingController:
 
         # Compute scale factors between consecutive keyframes
         self._calibrate_scale()
+
+        # Save metadata if requested
+        if save_metadata_to:
+            from pathlib import Path
+            self.keyframe_manager.save_metadata(Path(save_metadata_to))
 
         return True
 
@@ -487,9 +495,10 @@ class HomingController:
 
         # Single-axis control: move only in one direction at a time
         # This provides more stable and predictable flight
+        # SAFETY: Vertical control disabled - only forward and lateral movement
 
-        # Find the axis with largest error
-        errors_abs = [abs(error_forward), abs(error_lateral), abs(error_vertical)]
+        # Find the axis with largest error (excluding vertical for safety)
+        errors_abs = [abs(error_forward), abs(error_lateral)]
         max_error_idx = np.argmax(errors_abs)
         max_error = errors_abs[max_error_idx]
 
@@ -509,9 +518,7 @@ class HomingController:
             elif max_error_idx == 1:  # Lateral (left/right)
                 velocity_vector[1] = fixed_vel if error_lateral > 0 else -fixed_vel
                 axis_name = "right" if error_lateral > 0 else "left"
-            else:  # Vertical (up/down)
-                velocity_vector[2] = fixed_vel if error_vertical > 0 else -fixed_vel
-                axis_name = "up" if error_vertical > 0 else "down"
+            # Vertical control removed for safety
 
             # Calculate duration to reach target on this axis
             # duration = distance / velocity
@@ -531,10 +538,11 @@ class HomingController:
         yaw_rate = np.clip(yaw_rate, -self.config.max_yaw_rate, self.config.max_yaw_rate)
 
         # Build command (DJI coordinate system)
+        # SAFETY: vertical_velocity always 0 for safety
         command = {
             "pitch_velocity": float(velocity_vector[0]),  # forward
             "roll_velocity": float(velocity_vector[1]),   # lateral
-            "vertical_velocity": float(velocity_vector[2]),  # vertical
+            "vertical_velocity": 0.0,  # DISABLED FOR SAFETY
             "yaw_rate": float(yaw_rate),
         }
 
