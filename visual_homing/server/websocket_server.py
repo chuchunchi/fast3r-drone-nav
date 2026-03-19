@@ -14,7 +14,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Dict, Optional
 
 import websockets
 from websockets.asyncio.server import serve, ServerConnection
@@ -91,7 +91,7 @@ class WebSocketServer:
         self._frame_callback: Optional[
             Callable[[FrameMessage], Optional[dict]]
         ] = None
-        self._command_callback: Optional[Callable[[str, dict], None]] = None
+        self._command_callback: Optional[Callable[[str, dict], Optional[dict]]] = None
         self._state_callback: Optional[Callable[[], SystemState]] = None
 
         # Server state
@@ -120,13 +120,13 @@ class WebSocketServer:
 
     def set_command_callback(
         self,
-        callback: Callable[[str, dict], None],
+        callback: Callable[[str, dict], Optional[dict]],
     ) -> None:
         """
         Set callback for command events (for state machine control).
 
         Args:
-            callback: Function(command_type: str, data: dict)
+            callback: Function(command_type: str, data: dict) -> Optional[dict]
         """
         self._command_callback = callback
 
@@ -308,7 +308,9 @@ class WebSocketServer:
             logger.info(f"Command received: {command_type}")
 
             if self._command_callback:
-                self._command_callback(command_type, data)
+                response = self._command_callback(command_type, data)
+                if response and self._client:
+                    await self._client.websocket.send(json.dumps(response))
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON from client: {e}")

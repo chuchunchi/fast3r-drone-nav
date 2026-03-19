@@ -26,7 +26,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -57,6 +57,7 @@ class MockFrameProcessor:
         self.last_telemetry_time = None
         self.save_sample_image = save_sample_image
         self.image_validated = False
+        self.gimbal_pitch_deg = 0.0
         
         # Initialize video recorder
         self.video_recorder = DualPhaseVideoRecorder(
@@ -201,9 +202,57 @@ class MockFrameProcessor:
                 },
             }
 
-    def handle_command(self, cmd_type: str, data: dict) -> None:
+    def _command_result(self, cmd_type: str, ok: bool, **extra) -> dict:
+        """Create text command result payload."""
+        return {
+            "type": "command_result",
+            "command": cmd_type,
+            "ok": ok,
+            **extra,
+        }
+
+    def _validate_gimbal_pitch(self, value: Any) -> Optional[float]:
+        """Validate gimbal pitch; return float if valid else None."""
+        try:
+            pitch = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 <= pitch < 90.0):
+            return None
+        return pitch
+
+    def handle_command(self, cmd_type: str, data: dict) -> Optional[dict]:
         """Handle state transition commands."""
         logger.info(f"Command received: {cmd_type}")
+
+        if cmd_type == "init_gimbal_config":
+            current_state = self.state_machine.state
+            if current_state not in (SystemState.IDLE, SystemState.ARMED):
+                return self._command_result(
+                    cmd_type,
+                    False,
+                    reason="invalid_state",
+                    allowed_states=["IDLE", "ARMED"],
+                    current_state=current_state.name,
+                )
+
+            pitch = self._validate_gimbal_pitch(data.get("gimbal_pitch_deg"))
+            if pitch is None:
+                return self._command_result(
+                    cmd_type,
+                    False,
+                    reason="out_of_range",
+                    allowed_range_deg=[0.0, 89.9],
+                    received_gimbal_pitch_deg=data.get("gimbal_pitch_deg"),
+                )
+
+            self.gimbal_pitch_deg = pitch
+            logger.info(f"[Mock] Gimbal pitch configured: {pitch:.1f} deg")
+            return self._command_result(
+                cmd_type,
+                True,
+                gimbal_pitch_deg=self.gimbal_pitch_deg,
+            )
 
         if cmd_type == "start_recording":
             if self.state_machine.start_recording():
@@ -247,7 +296,10 @@ class MockFrameProcessor:
             self.frame_count = 0
             self.keyframe_count = 0
             self.total_distance = 0.0
+            self.gimbal_pitch_deg = 0.0
             logger.info("System reset")
+
+        return None
 
     def get_state(self) -> SystemState:
         """Get current system state."""
@@ -282,6 +334,8 @@ class ProductionFrameProcessor:
         self.config = config or Config()
         self.controller = HomingController(config=self.config)
         self.controller.initialize()
+        self.gimbal_pitch_deg = 0.0
+        self.controller.set_gimbal_pitch_deg(self.gimbal_pitch_deg)
         logger.info("Fast3R model loaded and ready")
 
         # Initialize flight session manager
@@ -292,6 +346,36 @@ class ProductionFrameProcessor:
 
         if self.config.video_recording_enabled:
             logger.info(f"Flight sessions will be saved to: {self.config.video_output_dir}")
+
+    def _command_result(self, cmd_type: str, ok: bool, **extra) -> dict:
+        """Create text command result payload."""
+        return {
+            "type": "command_result",
+            "command": cmd_type,
+            "ok": ok,
+            **extra,
+        }
+
+    def _validate_gimbal_pitch(self, value: Any) -> Optional[float]:
+        """Validate gimbal pitch; return float if valid else None."""
+        try:
+            pitch = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not (0.0 <= pitch < 90.0):
+            return None
+        return pitch
+
+    def _build_session_config(self) -> dict:
+        """Build configuration snapshot for flight metadata."""
+        return {
+            "keyframe_interval_m": self.config.keyframe_interval_m,
+            "keyframe_interval_s": self.config.keyframe_interval_s,
+            "waypoint_threshold_m": self.config.waypoint_threshold_m,
+            "fixed_flight_velocity": self.config.fixed_flight_velocity,
+            "min_confidence": self.config.min_confidence,
+            "gimbal_pitch_deg": self.gimbal_pitch_deg,
+        }
 
     def process_frame(self, frame: FrameMessage) -> dict:
         """Process frame through actual homing controller."""
@@ -341,9 +425,10 @@ class ProductionFrameProcessor:
 
         elif state == SystemState.HOMING:
             # Add frame to homing video (non-blocking)
-            self.video_recorder.add_homing_frame(
-                image, frame.timestamp_ms, frame.frame_id
-            )
+            if self.video_recorder:
+                self.video_recorder.add_homing_frame(
+                    image, frame.timestamp_ms, frame.frame_id
+                )
 
             # Check if enough time has passed to compute new command
             if self.controller.should_compute_new_command():
@@ -385,9 +470,44 @@ class ProductionFrameProcessor:
         else:
             return self._status_response()
 
-    def handle_command(self, cmd_type: str, data: dict) -> None:
+    def handle_command(self, cmd_type: str, data: dict) -> Optional[dict]:
         """Handle state transition commands."""
         logger.info(f"Command received: {cmd_type}")
+
+        if cmd_type == "init_gimbal_config":
+            current_state = self.controller.get_state()
+            if current_state not in (SystemState.IDLE, SystemState.ARMED):
+                return self._command_result(
+                    cmd_type,
+                    False,
+                    reason="invalid_state",
+                    allowed_states=["IDLE", "ARMED"],
+                    current_state=current_state.name,
+                )
+
+            pitch = self._validate_gimbal_pitch(data.get("gimbal_pitch_deg"))
+            if pitch is None:
+                return self._command_result(
+                    cmd_type,
+                    False,
+                    reason="out_of_range",
+                    allowed_range_deg=[0.0, 89.9],
+                    received_gimbal_pitch_deg=data.get("gimbal_pitch_deg"),
+                )
+
+            self.gimbal_pitch_deg = pitch
+            self.controller.set_gimbal_pitch_deg(self.gimbal_pitch_deg)
+            logger.info(f"Gimbal pitch configured: {self.gimbal_pitch_deg:.1f} deg")
+
+            # Keep session metadata in sync when available.
+            if self.flight_session.get_session_folder():
+                self.flight_session.save_config(self._build_session_config())
+
+            return self._command_result(
+                cmd_type,
+                True,
+                gimbal_pitch_deg=self.gimbal_pitch_deg,
+            )
 
         if cmd_type == "start_recording":
             if self.controller.start_recording():
@@ -405,14 +525,7 @@ class ProductionFrameProcessor:
                     self.video_recorder.start_teach_recording()
 
                 # Save config to session
-                config_dict = {
-                    "keyframe_interval_m": self.config.keyframe_interval_m,
-                    "keyframe_interval_s": self.config.keyframe_interval_s,
-                    "waypoint_threshold_m": self.config.waypoint_threshold_m,
-                    "fixed_flight_velocity": self.config.fixed_flight_velocity,
-                    "min_confidence": self.config.min_confidence,
-                }
-                self.flight_session.save_config(config_dict)
+                self.flight_session.save_config(self._build_session_config())
 
         elif cmd_type == "stop_recording":
             # Stop controller recording (computes scale)
@@ -474,6 +587,10 @@ class ProductionFrameProcessor:
                 self.flight_session.finalize_session()
 
             self.controller.reset()
+            self.gimbal_pitch_deg = 0.0
+            self.controller.set_gimbal_pitch_deg(self.gimbal_pitch_deg)
+
+        return None
 
     def get_state(self) -> SystemState:
         """Get current system state."""

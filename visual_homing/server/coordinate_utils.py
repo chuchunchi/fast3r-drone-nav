@@ -1,7 +1,7 @@
 """Coordinate frame utilities for converting between Fast3R and DJI frames."""
 
 import math
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -24,6 +24,71 @@ def extract_yaw_error(R: torch.Tensor) -> float:
     # This gives the rotation needed to align Z axes
     yaw_rad = torch.atan2(R[0, 2], R[2, 2])
     return float(yaw_rad) * 180.0 / math.pi
+
+
+def reproject_pose_error_gimbal_aware(
+    t_cam: np.ndarray,
+    R_cam: torch.Tensor,
+    gimbal_pitch_deg: float,
+) -> Tuple[float, float, float, float]:
+    """
+    Reproject camera-frame pose error into body-aligned planar control errors.
+
+    Args:
+        t_cam: Camera-frame translation [x_right, y_down, z_forward] in meters.
+        R_cam: Relative rotation matrix in camera frame (3x3).
+        gimbal_pitch_deg: Downward gimbal pitch in degrees.
+
+    Returns:
+        Tuple:
+            error_forward_m, error_lateral_m, error_yaw_deg, distance_planar_m
+    """
+    t = np.asarray(t_cam, dtype=np.float64).reshape(-1)
+    if t.size < 3 or not np.isfinite(t[:3]).all():
+        return 0.0, 0.0, 0.0, 0.0
+
+    # Safety clamp here is a defensive fallback. Input validation is handled upstream.
+    alpha_deg = float(np.clip(gimbal_pitch_deg, 0.0, 89.9))
+    alpha_rad = math.radians(alpha_deg)
+    sin_a = math.sin(alpha_rad)
+    cos_a = math.cos(alpha_rad)
+
+    x_c, y_c, z_c = float(t[0]), float(t[1]), float(t[2])
+
+    # Camera (X right, Y down, Z forward) -> Body (X forward, Y right, Z down)
+    body_x = z_c * cos_a - y_c * sin_a
+    body_y = x_c
+    distance_planar = math.sqrt(body_x * body_x + body_y * body_y)
+
+    # Preserve exact legacy parallel-view behavior when alpha is zero.
+    if abs(alpha_deg) < 1e-9:
+        yaw_deg = extract_yaw_error(R_cam)
+        distance_3d = math.sqrt(x_c * x_c + y_c * y_c + z_c * z_c)
+        return body_x, body_y, yaw_deg, distance_3d
+
+    if torch.is_tensor(R_cam):
+        # Avoid direct Tensor.numpy() so this works even in environments
+        # where PyTorch was built without NumPy bridge support.
+        R_np = np.asarray(R_cam.detach().cpu().tolist(), dtype=np.float64)
+    else:
+        R_np = np.asarray(R_cam)
+
+    if R_np.shape != (3, 3) or not np.isfinite(R_np).all():
+        return 0.0, 0.0, 0.0, 0.0
+
+    R_c_to_b = np.array(
+        [
+            [0.0, -sin_a, cos_a],
+            [1.0, 0.0, 0.0],
+            [0.0, cos_a, sin_a],
+        ],
+        dtype=np.float64,
+    )
+    R_body = R_c_to_b @ R_np @ R_c_to_b.T
+    yaw_rad = math.atan2(float(R_body[1, 0]), float(R_body[0, 0]))
+    yaw_deg = math.degrees(yaw_rad)
+
+    return body_x, body_y, yaw_deg, distance_planar
 
 
 def extract_euler_angles(R: torch.Tensor) -> Tuple[float, float, float]:
@@ -106,7 +171,7 @@ def fast3r_to_dji_command(
     t_cam: np.ndarray,
     yaw_error_deg: float,
     pid_gains: Dict[str, float],
-    velocity_limits: Dict[str, float] = None,
+    velocity_limits: Optional[Dict[str, float]] = None,
 ) -> Dict[str, float]:
     """
     Convert Fast3R pose error (camera frame) to DJI VirtualStick commands.

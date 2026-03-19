@@ -10,7 +10,11 @@ import numpy as np
 import torch
 
 from .config import Config, default_config
-from .coordinate_utils import create_hover_command, extract_yaw_error, fast3r_to_dji_command
+from .coordinate_utils import (
+    create_hover_command,
+    fast3r_to_dji_command,
+    reproject_pose_error_gimbal_aware,
+)
 from .fast3r_engine import Fast3REngine
 from .keyframe_manager import Keyframe, KeyframeStackManager, Telemetry
 from .pid_controller import MultiAxisPIDController
@@ -78,7 +82,7 @@ class HomingController:
     def __init__(
         self,
         fast3r_engine: Optional[Fast3REngine] = None,
-        config: Config = None,
+        config: Optional[Config] = None,
     ):
         """
         Initialize homing controller.
@@ -134,6 +138,7 @@ class HomingController:
         # Homing state
         self.target_idx: int = -1
         self.metric_scale: float = 1.0
+        self.gimbal_pitch_deg: float = 0.0
 
         # Rate limiting for safety
         self._last_command_time: float = 0.0
@@ -407,14 +412,16 @@ class HomingController:
         R = pose_result.rotation
         self._last_translation = t_cam.copy()
 
-        # Camera frame: X=right, Y=down, Z=forward
-        error_forward = float(t_cam[2])
-        error_lateral = float(t_cam[0])
-        error_vertical = -float(t_cam[1])  # Invert: down→up
-        error_yaw = extract_yaw_error(R)
-
-        # Compute distance to target
-        distance_to_target = float(np.linalg.norm(t_cam))
+        (
+            error_forward,
+            error_lateral,
+            error_yaw,
+            distance_to_target,
+        ) = reproject_pose_error_gimbal_aware(
+            t_cam=t_cam,
+            R_cam=R,
+            gimbal_pitch_deg=self.gimbal_pitch_deg,
+        )
         
         # Check for low confidence
         low_confidence = pose_result.confidence < self.config.min_confidence
@@ -625,6 +632,10 @@ class HomingController:
         """Get current system state."""
         return self.state_machine.state
 
+    def set_gimbal_pitch_deg(self, pitch_deg: float) -> None:
+        """Set fixed gimbal pitch for homing (degrees, downward-positive)."""
+        self.gimbal_pitch_deg = float(np.clip(pitch_deg, 0.0, 89.9))
+
     def get_keyframe_count(self) -> int:
         """Get number of recorded keyframes."""
         return len(self.keyframe_manager)
@@ -646,6 +657,7 @@ class HomingController:
         self.pid.reset()
         self.target_idx = -1
         self.metric_scale = 1.0
+        self.gimbal_pitch_deg = 0.0
         self.stats = HomingStats()
         self._consecutive_failures = 0
         self._last_pose_result = None
