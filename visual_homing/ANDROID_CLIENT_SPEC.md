@@ -369,6 +369,16 @@ public class ImageProcessor {
 }
 ```
 
+**Command Result:**
+```json
+{
+    "type": "command_result",
+    "command": "init_gimbal_config",
+    "ok": true,
+    "gimbal_pitch_deg": 30.0
+}
+```
+
 **Emergency Stop:**
 ```json
 {
@@ -395,6 +405,8 @@ public class ControlResponseParser {
             return parseEmergencyStop(root);
         } else if (type.equals("heartbeat_ack")) {
             return parseHeartbeatAck(root);
+        } else if (type.equals("command_result")) {
+            return parseCommandResult(root);
         }
         
         throw new JSONException("Unknown message type: " + type);
@@ -422,9 +434,26 @@ public class ControlResponseParser {
         
         return response;
     }
+
+    private ControlResponse parseCommandResult(JSONObject root)
+            throws JSONException {
+        ControlResponse response = new ControlResponse();
+        response.messageType = root.getString("type");
+        response.command = root.getString("command");
+        response.ok = root.getBoolean("ok");
+        response.gimbalPitchDeg = (float) root.optDouble("gimbal_pitch_deg", 0.0);
+        response.errorReason = root.optString("reason", "");
+        return response;
+    }
 }
 
 public class ControlResponse {
+    public String messageType;
+    public String command;
+    public boolean ok;
+    public float gimbalPitchDeg;
+    public String errorReason;
+
     public int frameId;
     public long timestampMs;
     public double serverLatencyMs;
@@ -510,6 +539,18 @@ public class CommandSender {
     
     public void reset() {
         sendCommand("reset");
+    }
+
+    public void initGimbalConfig(float gimbalPitchDeg) {
+        try {
+            JSONObject cmd = new JSONObject();
+            cmd.put("type", "init_gimbal_config");
+            cmd.put("timestamp_ms", System.currentTimeMillis());
+            cmd.put("gimbal_pitch_deg", gimbalPitchDeg);
+            webSocket.send(cmd.toString());
+        } catch (JSONException e) {
+            Log.e(TAG, "Failed to create gimbal config command", e);
+        }
     }
 }
 ```
