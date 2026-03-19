@@ -21,6 +21,8 @@ from visual_homing.protocol.messages import (
     StatusMessage,
     Telemetry,
 )
+from visual_homing.run_server import MockFrameProcessor
+from visual_homing.server.state_machine import SystemState
 from visual_homing.server.websocket_server import WebSocketServer
 
 
@@ -349,6 +351,64 @@ class TestWebSocketCommands:
 
         finally:
             await server.stop()
+
+    @pytest.mark.asyncio
+    async def test_command_callback_response(self):
+        """Test that command callback response is sent to client."""
+        import websockets
+
+        def command_callback(cmd_type: str, data: dict):
+            if cmd_type == "init_gimbal_config":
+                return {
+                    "type": "command_result",
+                    "command": cmd_type,
+                    "ok": True,
+                    "gimbal_pitch_deg": data.get("gimbal_pitch_deg", 0.0),
+                }
+            return None
+
+        server = WebSocketServer(port=8776)
+        server.set_command_callback(command_callback)
+        await server.start()
+
+        try:
+            async with websockets.connect("ws://localhost:8776") as ws:
+                await ws.send(json.dumps({
+                    "type": "init_gimbal_config",
+                    "gimbal_pitch_deg": 30.0,
+                    "timestamp_ms": int(time.time() * 1000),
+                }))
+
+                response = await asyncio.wait_for(ws.recv(), timeout=2.0)
+                response_data = json.loads(response)
+
+                assert response_data["type"] == "command_result"
+                assert response_data["command"] == "init_gimbal_config"
+                assert response_data["ok"] is True
+                assert response_data["gimbal_pitch_deg"] == 30.0
+
+        finally:
+            await server.stop()
+
+    async def test_mock_processor_keeps_idle_gimbal_config_across_recording(self):
+        """IDLE gimbal config should persist through teach into ARMED."""
+        processor = MockFrameProcessor(save_sample_image=False)
+
+        result = processor.handle_command(
+            "init_gimbal_config",
+            {"gimbal_pitch_deg": 30.0},
+        )
+        assert result is not None
+        assert result["ok"] is True
+        assert processor.gimbal_pitch_deg == 30.0
+
+        processor.handle_command("start_recording", {"type": "start_recording"})
+        assert processor.get_state() == SystemState.RECORDING
+        assert processor.gimbal_pitch_deg == 30.0
+
+        processor.handle_command("stop_recording", {"type": "stop_recording"})
+        assert processor.get_state() == SystemState.ARMED
+        assert processor.gimbal_pitch_deg == 30.0
 
 
 class TestWebSocketBroadcast:

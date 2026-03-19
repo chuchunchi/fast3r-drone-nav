@@ -17,6 +17,7 @@ from visual_homing.server.coordinate_utils import (
     fast3r_to_dji_command,
     extract_yaw_error,
     extract_euler_angles,
+    reproject_pose_error_gimbal_aware,
     rotation_matrix_from_euler,
     create_hover_command,
 )
@@ -158,6 +159,46 @@ class TestYawExtraction:
         # For this rotation: R[0,2] = sin(45°), R[2,2] = cos(45°)
         # So yaw = atan2(sin(45°), cos(45°)) = 45°
         assert abs(yaw - 45.0) < 1.0  # Should be approximately 45 degrees
+
+
+class TestGimbalAwareReprojection:
+    """Tests for gimbal-aware planar reprojection."""
+
+    def test_zero_pitch_preserves_legacy_distance_and_yaw(self):
+        """Zero pitch should match legacy parallel-view distance and yaw."""
+        t_cam = np.array([1.0, 2.0, 3.0], dtype=np.float64)
+        angle = np.pi / 6  # 30 degrees yaw in camera frame
+        R = torch.tensor([
+            [np.cos(angle), 0, np.sin(angle)],
+            [0, 1, 0],
+            [-np.sin(angle), 0, np.cos(angle)],
+        ], dtype=torch.float32)
+
+        error_forward, error_lateral, error_yaw, distance = (
+            reproject_pose_error_gimbal_aware(t_cam, R, 0.0)
+        )
+
+        assert np.isclose(error_forward, 3.0)
+        assert np.isclose(error_lateral, 1.0)
+        assert np.isclose(error_yaw, extract_yaw_error(R))
+        assert np.isclose(distance, np.linalg.norm(t_cam))
+
+    def test_downward_pitch_reprojects_forward_component(self):
+        """Downward pitch should mix camera Y/Z into body forward."""
+        t_cam = np.array([0.5, 1.0, 2.0], dtype=np.float64)
+        R = torch.eye(3)
+
+        error_forward, error_lateral, error_yaw, distance = (
+            reproject_pose_error_gimbal_aware(t_cam, R, 30.0)
+        )
+
+        expected_forward = 2.0 * math.cos(math.radians(30.0)) - 1.0 * math.sin(math.radians(30.0))
+        expected_lateral = 0.5
+
+        assert np.isclose(error_forward, expected_forward)
+        assert np.isclose(error_lateral, expected_lateral)
+        assert np.isclose(error_yaw, 0.0)
+        assert np.isclose(distance, math.sqrt(expected_forward ** 2 + expected_lateral ** 2))
 
 
 class TestEulerAngles:
