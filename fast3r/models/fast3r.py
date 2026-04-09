@@ -549,11 +549,9 @@ class Fast3R(nn.Module,
             list[dict]: Two-element list of per-view result dicts, identical
             in format to ``forward([live_view, target_view])``.
         """
-        if self.local_head is not None:
-            raise NotImplementedError(
-                "forward_pair_cached() does not support local_head. "
-                "Use forward() instead."
-            )
+        # local_head output (pts3d_local) is not needed by the homing
+        # pipeline, so we simply skip it here.  Only the global head
+        # (pts3d_in_other_view, conf) is computed.
 
         profiling_info = {} if profiling else None
         num_images = 2
