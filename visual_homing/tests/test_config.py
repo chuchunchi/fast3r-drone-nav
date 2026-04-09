@@ -32,10 +32,10 @@ class TestConfig:
 
         # Keyframe settings
         assert config.keyframe_interval_m == 2.0
-        assert config.keyframe_interval_s == 3.0
+        assert config.keyframe_interval_s == 4.0
 
         # Homing settings
-        assert config.waypoint_threshold_m == 0.8
+        assert config.waypoint_threshold_m == 1.0
         assert config.confidence_threshold == 0.3
 
     def test_custom_config(self):
@@ -51,37 +51,37 @@ class TestConfig:
         assert config.max_forward_velocity == 3.0
 
         # Other values should remain default
-        assert config.keyframe_interval_s == 3.0
+        assert config.keyframe_interval_s == 4.0
 
     def test_pid_gains(self):
         """Test PID gain defaults."""
         config = Config()
 
         # Forward PID
-        assert config.pid_forward_kp == 0.5
-        assert config.pid_forward_ki == 0.01
-        assert config.pid_forward_kd == 0.1
+        assert config.pid_forward_kp == 5.0
+        assert config.pid_forward_ki == 0.1
+        assert config.pid_forward_kd == 0.5
 
         # Lateral PID
-        assert config.pid_lateral_kp == 0.5
+        assert config.pid_lateral_kp == 5.0
 
-        # Vertical PID (different gains)
-        assert config.pid_vertical_kp == 0.3
-        assert config.pid_vertical_kd == 0.05
+        # Vertical PID (disabled for safety)
+        assert config.pid_vertical_kp == 0.0
+        assert config.pid_vertical_kd == 0.0
 
         # Yaw PID
-        assert config.pid_yaw_kp == 1.0
+        assert config.pid_yaw_kp == 0.6
         assert config.pid_yaw_ki == 0.0
 
     def test_velocity_limits(self):
         """Test velocity limit defaults."""
         config = Config()
 
-        assert config.max_forward_velocity == 0.5
-        assert config.max_lateral_velocity == 0.5
-        assert config.max_vertical_velocity == 0.2
-        assert config.max_yaw_rate == 20.0
-        assert config.max_total_velocity == 0.6
+        assert config.max_forward_velocity == 1.0
+        assert config.max_lateral_velocity == 1.0
+        assert config.max_vertical_velocity == 0.3
+        assert config.max_yaw_rate == 10.0
+        assert config.max_total_velocity == 1.2
 
     def test_safety_settings(self):
         """Test safety setting defaults."""
@@ -103,7 +103,7 @@ class TestConfig:
         """Test waypoint confirmation defaults."""
         config = Config()
 
-        assert config.waypoint_confirm_frames == 2
+        assert config.waypoint_confirm_frames == 1
 
     def test_communication_settings(self):
         """Test communication setting defaults."""

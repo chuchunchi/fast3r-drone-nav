@@ -107,12 +107,12 @@ class TestKeyframeStackManager:
         """Test keyframe is pushed after moving threshold distance."""
         # First frame
         frame1 = make_frame()
-        telem1 = make_telemetry(timestamp_ms=1000, vx=2.0)
+        telem1 = make_telemetry(timestamp_ms=1000, vx=5.0)
         manager.process_frame(frame1, telem1)
 
-        # Move 2m forward (vx=2.0 m/s for 1 second)
+        # Move 2m forward: 5.0 m/s * 0.4s = 2.0m (use dt < MAX_DT_SECONDS)
         frame2 = make_frame()
-        telem2 = make_telemetry(timestamp_ms=2000, vx=2.0)
+        telem2 = make_telemetry(timestamp_ms=1400, vx=5.0)
         kf2 = manager.process_frame(frame2, telem2)
 
         assert kf2 is not None
@@ -163,14 +163,15 @@ class TestKeyframeStackManager:
 
     def test_cumulative_distance_tracking(self, manager):
         """Test cumulative distance is tracked correctly."""
-        # Move at 1 m/s for 5 seconds
+        # Move at 2.0 m/s with 100ms intervals (dt=0.1s, well under MAX_DT_SECONDS)
+        # 25 frames * 0.1s * 2.0 m/s = 5.0m
         frame1 = make_frame()
-        telem1 = make_telemetry(timestamp_ms=0, vx=1.0)
+        telem1 = make_telemetry(timestamp_ms=0, vx=2.0)
         manager.process_frame(frame1, telem1)
 
-        for i in range(1, 6):
+        for i in range(1, 26):
             frame = make_frame()
-            telem = make_telemetry(timestamp_ms=i * 1000, vx=1.0)
+            telem = make_telemetry(timestamp_ms=i * 100, vx=2.0)
             manager.process_frame(frame, telem)
 
         # Should have accumulated ~5m
@@ -216,16 +217,17 @@ class TestKeyframeStackManager:
 
     def test_inter_keyframe_distance(self, manager):
         """Test computing distance between keyframes."""
-        # Add keyframes at known distances
+        # Add keyframes at known distances using dt < MAX_DT_SECONDS (0.5s)
+        # 5.0 m/s * 0.4s = 2.0m per interval
         for i in range(3):
             frame = make_frame()
-            telem = make_telemetry(timestamp_ms=i * 1000, vx=2.0)
+            telem = make_telemetry(timestamp_ms=i * 400, vx=5.0)
             manager.process_frame(frame, telem, force_keyframe=True)
 
         dist_01 = manager.get_inter_keyframe_distance(0, 1)
         dist_12 = manager.get_inter_keyframe_distance(1, 2)
 
-        # Each interval should be ~2m (2 m/s * 1s)
+        # Each interval should be ~2m (5 m/s * 0.4s)
         assert abs(dist_01 - 2.0) < 0.1
         assert abs(dist_12 - 2.0) < 0.1
 
@@ -255,7 +257,7 @@ class TestKeyframeStackManager:
         """Test clearing the manager."""
         for i in range(3):
             frame = make_frame()
-            telem = make_telemetry(timestamp_ms=i * 1000, vx=1.0)
+            telem = make_telemetry(timestamp_ms=i * 400, vx=1.0)
             manager.process_frame(frame, telem, force_keyframe=True)
 
         assert manager.get_stack_size() == 3
