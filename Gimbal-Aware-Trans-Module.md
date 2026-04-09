@@ -144,6 +144,27 @@ Invalid-state:
 }
 ```
 
+### 4.8 Handshake Sequence Chart
+
+```mermaid
+sequenceDiagram
+    participant A as Android Client
+    participant S as Server
+
+    Note over A,S: Precondition: system state is IDLE or ARMED
+    A->>S: {"type":"init_gimbal_config","gimbal_pitch_deg":30.0}
+    alt Valid range and valid state
+        S-->>A: {"type":"command_result","command":"init_gimbal_config","ok":true,"gimbal_pitch_deg":30.0}
+        Note over S: Store pitch for current flight session
+    else Out of range / invalid payload
+        S-->>A: {"type":"command_result","command":"init_gimbal_config","ok":false,"reason":"out_of_range",...}
+        A->>A: Show error and let user resubmit
+    else Invalid state (e.g., HOMING)
+        S-->>A: {"type":"command_result","command":"init_gimbal_config","ok":false,"reason":"invalid_state",...}
+        A->>A: Keep current value; retry later
+    end
+```
+
 ## 5. Module I/O Definition
 
 This module is an **internal server-side module**.
