@@ -159,6 +159,10 @@ class HomingController:
         self._last_distance: float = float('inf')
         self._frames_without_progress: int = 0
 
+        # Cached target encoding for pairwise inference
+        self._cached_target_encoding: Optional[tuple] = None
+        self._cached_target_idx: int = -1
+
     def initialize(self) -> None:
         """Initialize the controller (load model, etc.)."""
         if not self.fast3r.is_loaded():
@@ -280,6 +284,9 @@ class HomingController:
         self._last_distance = float('inf')
         self._frames_without_progress = 0
 
+        # Pre-encode the first target keyframe
+        self._cache_target_encoding()
+
         logger.info(f"Starting homing with {self.target_idx + 1} keyframes")
         logger.info(f"Metric scale: {self.metric_scale:.4f}")
         return True
@@ -367,9 +374,21 @@ class HomingController:
         # Get target keyframe
         target_keyframe = self.keyframe_manager[self.target_idx]
 
-        # Run Fast3R inference with timing
+        # Run Fast3R inference with timing (cached when possible)
         t_start = time.time()
-        result = self.fast3r.infer_pair(live_frame, target_keyframe.image)
+        if (
+            self._cached_target_encoding is not None
+            and self._cached_target_idx == self.target_idx
+        ):
+            result = self.fast3r.infer_pair_cached(
+                live_frame, self._cached_target_encoding
+            )
+        else:
+            self._cache_target_encoding()
+            assert self._cached_target_encoding is not None
+            result = self.fast3r.infer_pair_cached(
+                live_frame, self._cached_target_encoding
+            )
         inference_time_ms = (time.time() - t_start) * 1000
         self.stats.total_inference_time_ms += inference_time_ms
 
@@ -603,6 +622,20 @@ class HomingController:
             inference_time_ms=inference_time_ms,
         )
 
+    def _cache_target_encoding(self) -> None:
+        """Encode and cache the current target keyframe."""
+        if self.target_idx < 0:
+            self._cached_target_encoding = None
+            self._cached_target_idx = -1
+            return
+
+        target_kf = self.keyframe_manager[self.target_idx]
+        self._cached_target_encoding = self.fast3r.encode_target(
+            target_kf.image
+        )
+        self._cached_target_idx = self.target_idx
+        logger.debug(f"Cached encoder output for target keyframe {self.target_idx}")
+
     def _advance_to_next_keyframe(self) -> None:
         """Advance to the next keyframe in the stack."""
         logger.info(
@@ -620,6 +653,9 @@ class HomingController:
         self._last_distance = float('inf')
         self._frames_without_progress = 0
         self._consecutive_failures = 0
+
+        # Pre-encode the new target keyframe
+        self._cache_target_encoding()
 
         if self.target_idx < 0:
             logger.info("All keyframes reached, homing complete!")
@@ -666,11 +702,15 @@ class HomingController:
         self._waypoint_confirm_count = 0
         self._last_distance = float('inf')
         self._frames_without_progress = 0
+        self._cached_target_encoding = None
+        self._cached_target_idx = -1
         logger.info("Homing controller reset")
 
     def emergency_stop(self) -> Dict[str, float]:
         """Immediate stop - return hover command."""
         self.pid.reset()
+        self._cached_target_encoding = None
+        self._cached_target_idx = -1
         return create_hover_command()
     
     def get_stats(self) -> HomingStats:

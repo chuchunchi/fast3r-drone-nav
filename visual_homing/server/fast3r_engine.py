@@ -329,6 +329,95 @@ class Fast3REngine:
             "preds": preds,
         }
 
+    # ------------------------------------------------------------------
+    # Cached pairwise inference
+    # ------------------------------------------------------------------
+
+    @property
+    def _autocast_dtype(self) -> torch.dtype:
+        """Resolve the effective autocast dtype.
+
+        The standard inference path passes ``self.dtype`` as the *precision*
+        arg to ``loss_of_one_batch()``, which only recognises the string
+        ``"32"`` and ``torch.bfloat16``.  Every other value falls through
+        to the default CUDA autocast dtype (``torch.float16``).
+        """
+        if self.dtype == torch.bfloat16:
+            return torch.bfloat16
+        return torch.float16
+
+    @torch.no_grad()
+    def encode_target(
+        self, image: np.ndarray
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pre-encode a target image for cached pairwise inference.
+
+        Args:
+            image: RGB image as numpy array (H, W, 3), uint8.
+
+        Returns:
+            ``(encoded_feat, position, true_shape)`` tuple that can be
+            passed to :meth:`infer_pair_cached`.
+        """
+        if not self._loaded:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        view = self._prepare_image(image)
+        with torch.autocast(
+            device_type=self.device.type, dtype=self._autocast_dtype
+        ):
+            return self.model.encode_image(view)
+
+    @torch.no_grad()
+    def infer_pair_cached(
+        self,
+        live_image: np.ndarray,
+        cached_target: Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Run pairwise inference using a pre-encoded target.
+
+        Produces the same output format as :meth:`infer_pair`, but skips
+        the encoder for the target image.
+
+        Args:
+            live_image:    Current camera frame (H, W, 3), uint8.
+            cached_target: Output of :meth:`encode_target` for the
+                           reference keyframe.
+
+        Returns:
+            Dict with ``pts3d_1``, ``pts3d_2``, ``conf_1``, ``conf_2``,
+            and ``preds`` — identical format to :meth:`infer_pair`.
+        """
+        if not self._loaded:
+            raise RuntimeError("Model not loaded. Call load_model() first.")
+
+        live_view = self._prepare_image(live_image)
+        with torch.autocast(
+            device_type=self.device.type, dtype=self._autocast_dtype
+        ):
+            preds = self.model.forward_pair_cached(live_view, cached_target)
+
+        pts3d_1 = preds[0]["pts3d_in_other_view"]
+        pts3d_2 = preds[1]["pts3d_in_other_view"]
+        conf_1 = preds[0]["conf"]
+        conf_2 = preds[1]["conf"]
+
+        if pts3d_1.dim() == 4 and pts3d_1.shape[0] == 1:
+            pts3d_1 = pts3d_1.squeeze(0)
+            pts3d_2 = pts3d_2.squeeze(0)
+            conf_1 = conf_1.squeeze(0)
+            conf_2 = conf_2.squeeze(0)
+
+        return {
+            "pts3d_1": pts3d_1,
+            "pts3d_2": pts3d_2,
+            "conf_1": conf_1,
+            "conf_2": conf_2,
+            "preds": preds,
+        }
+
+    # ------------------------------------------------------------------
+
     def get_device(self) -> torch.device:
         """Get the device the model is running on."""
         return self.device

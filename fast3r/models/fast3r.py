@@ -295,6 +295,33 @@ class Fast3R(nn.Module,
 
         return encoded_feats, positions, shapes
 
+    def encode_image(
+        self, view: dict
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Encode a single image through the encoder.
+
+        This is the building block for cached pairwise inference: the target
+        keyframe can be encoded once and reused across many live frames.
+
+        Args:
+            view: A single view dict with 'img' (1, C, H, W) and
+                  optionally 'true_shape' (1, 2).
+
+        Returns:
+            (encoded_feat, position, true_shape):
+                encoded_feat: (1, P, D) encoder features
+                position:     (1, P, 2) positional encoding
+                true_shape:   (1, 2) spatial dimensions used for encoding
+        """
+        img = view["img"]
+        B = img.shape[0]
+        true_shape = view.get(
+            "true_shape",
+            torch.tensor(img.shape[-2:])[None].repeat(B, 1).to(img.device),
+        )
+        feat, pos = self.encoder(img, true_shape)
+        return feat, pos, true_shape
+
     def set_max_parallel_views_for_head(self, max_parallel_views_for_head):
         # expose this to user to control the number of views processed in parallel in the head
         self.max_parallel_views_for_head = max_parallel_views_for_head
@@ -495,6 +522,134 @@ class Fast3R(nn.Module,
             return final_results, profiling_info
         else:
             return final_results
+
+    def forward_pair_cached(
+        self,
+        live_view: dict,
+        cached_target: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        profiling: bool = False,
+    ) -> list[dict]:
+        """Pairwise inference with a pre-encoded target image.
+
+        The live image is encoded on the fly.  The cached target's encoder
+        output is reused directly.  The decoder and head run on the combined
+        features exactly as in the standard forward() path.
+
+        Only the same-resolution, inference-mode head path is supported
+        (B=1, N=2, eval mode).  ``local_head`` is not supported; an error
+        is raised if the model has one.
+
+        Args:
+            live_view:     View dict for the live frame ('img', 'true_shape').
+            cached_target: ``(encoded_feat, position, true_shape)`` from a
+                           prior :meth:`encode_image` call.
+            profiling:     Whether to return profiling info.
+
+        Returns:
+            list[dict]: Two-element list of per-view result dicts, identical
+            in format to ``forward([live_view, target_view])``.
+        """
+        if self.local_head is not None:
+            raise NotImplementedError(
+                "forward_pair_cached() does not support local_head. "
+                "Use forward() instead."
+            )
+
+        profiling_info = {} if profiling else None
+        num_images = 2
+
+        # ---- 1. Encode the live image only --------------------------------
+        encode_start = time.time()
+        live_feat, live_pos, live_shape = self.encode_image(live_view)
+        if profiling:
+            torch.cuda.synchronize()
+            profiling_info["encode_images_time"] = time.time() - encode_start
+
+        # ---- 2. Assemble features from live + cached target ----------------
+        cached_feat, cached_pos, cached_shape = cached_target
+        encoded_feats = [live_feat, cached_feat]
+        positions = [live_pos, cached_pos]
+        shapes = [live_shape, cached_shape]
+
+        # ---- 3. Build image IDs -------------------------------------------
+        B = live_feat.shape[0]
+        device = live_feat.device
+        image_ids = []
+        for i, feat in enumerate(encoded_feats):
+            num_patches = feat.shape[1]
+            image_ids.extend([i] * num_patches)
+        image_ids = (
+            torch.tensor(image_ids * B).reshape(B, -1).to(device)
+        )
+
+        # ---- 4. Decoder ---------------------------------------------------
+        if profiling:
+            torch.cuda.synchronize()
+            dec_start = time.time()
+        dec_output = self.decoder(encoded_feats, positions, image_ids)
+        if profiling:
+            torch.cuda.synchronize()
+            profiling_info["decoder_time"] = time.time() - dec_start
+
+        # ---- 5. Head (same-resolution, inference-only path) ----------------
+        head_start = time.time()
+        P_patches = encoded_feats[0].shape[1]
+
+        gathered_outputs_list = []
+        for layer_output in dec_output:
+            layer_output = rearrange(
+                layer_output,
+                'B (num_images P_patches) D -> (num_images B) P_patches D',
+                num_images=num_images,
+                P_patches=P_patches,
+            )
+            gathered_outputs_list.append(layer_output)
+
+        concatenated_shapes = torch.cat(shapes, dim=0)
+
+        shape_chunks = torch.split(
+            concatenated_shapes, self.max_parallel_views_for_head, dim=0
+        )
+        num_chunks = len(shape_chunks)
+
+        chunked_gathered_outputs_list = [[] for _ in range(num_chunks)]
+        for layer_output in gathered_outputs_list:
+            split_outputs = torch.split(
+                layer_output, self.max_parallel_views_for_head, dim=0
+            )
+            for chunk_idx, split_output in enumerate(split_outputs):
+                chunked_gathered_outputs_list[chunk_idx].append(split_output)
+
+        result_chunks = []
+        for chunk, chunk_shapes in zip(
+            chunked_gathered_outputs_list, shape_chunks
+        ):
+            result_chunks.append(self.head(chunk, chunk_shapes))
+
+        result = {
+            key: torch.cat([c[key] for c in result_chunks], dim=0)
+            for key in result_chunks[0].keys()
+        }
+
+        # ---- 6. Remap to per-view dicts -----------------------------------
+        final_results: list[dict] = [{} for _ in range(num_images)]
+        for key in result.keys():
+            for img_id in range(num_images):
+                img_result = result[key][img_id * B : (img_id + 1) * B]
+                if key == 'pts3d':
+                    final_results[img_id]['pts3d_in_other_view'] = img_result
+                else:
+                    final_results[img_id][key] = img_result
+
+        if profiling:
+            torch.cuda.synchronize()
+            now = time.time()
+            profiling_info["head_forward_time"] = now - head_start
+            profiling_info["total_time"] = now - encode_start
+            return final_results, profiling_info
+
+        return final_results
+
 
 class CroCoEncoder(nn.Module):
     def __init__(
